@@ -1,16 +1,15 @@
 """
-Superconductivity critical_temp regression — Stacking Ensemble v9.
-Architecture: XGB + LightGBM + ExtraTrees + Cubist (4-model)
-             → XGBoost Meta-learner (depth=2, strong regularization)
+Superconductivity critical_temp regression — Stacking Ensemble v10.
+Architecture: XGB + LightGBM + ExtraTrees + Cubist + HistGradientBoosting (5-model)
+             → XGBoost Meta-learner (HPO-optimized, 25-trial)
 
-Key changes over train_v8.py:
-  - 90/10 Train/Test split (Val removed, +1,701 training samples)
-  - XGBoost meta-learner replaces SLSQP (nonlinear blending)
-  - Full HPO in current feature space: XGB=25, LGB=25, ET=20, Cubist=20 (v8 warm-start)
-  - SMOGN tuned: threshold=50K, ratio=2.0
-  - IsotonicRegression residual calibration post-processing
-  - Always use 3-seed ensemble (no Val-based model selection)
-  - Global renames: v8 → v9 throughout (LOG_FILE, MODEL_PATH, HPO_CACHE_DIR, checkpoint)
+Key changes over train_v9.py:
+  - 5 base models: +HistGradientBoosting (diverse gradient boosting, no GPU dependency)
+  - Meta-learner HPO: 25-trial Optuna search on OOF predictions
+  - HPO n_estimators increased: XGB/LGB=1500, ET/Cubist/HGB=1000
+  - Stratified KFold (5 Tc bins) for HPO; Repeated 5×2-fold CV for stacking
+  - 3 BCS-inspired physics features (ion_polar_proxy, el_phonon_coupling, band_filling)
+  - Global renames: v9 → v10 throughout (LOG_FILE, MODEL_PATH, HPO_CACHE_DIR, checkpoint)
 """
 import warnings, time, gc, argparse, traceback, json, os
 from pathlib import Path
@@ -20,9 +19,9 @@ import joblib
 import optuna
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
-from sklearn.model_selection import KFold, train_test_split
+from sklearn.model_selection import KFold, RepeatedKFold, StratifiedKFold, train_test_split
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
-from sklearn.ensemble import ExtraTreesRegressor
+from sklearn.ensemble import ExtraTreesRegressor, HistGradientBoostingRegressor
 from sklearn.linear_model import Ridge
 from sklearn.preprocessing import PowerTransformer
 from sklearn.feature_selection import VarianceThreshold
@@ -32,8 +31,8 @@ from sklearn.isotonic import IsotonicRegression
 warnings.filterwarnings("ignore")
 
 ROOT = Path(__file__).resolve().parents[0]
-LOG_FILE = ROOT / "training_log_v9.txt"
-MODEL_PATH = "model_v9.pkl"
+LOG_FILE = ROOT / "training_log_v10.txt"
+MODEL_PATH = "model_v10.pkl"
 
 def _detect_gpu():
     """Detect CUDA GPU availability. Returns (has_gpu, device_str)."""
@@ -67,10 +66,10 @@ SMOGN_THRESHOLD   = 50.0
 SMOGN_BOOST_RATIO = 2.0
 SMOGN_NOISE_SCALE = 0.005
 
-HPO_CACHE_DIR_V8 = ROOT / "hpo_cache_v8"
 HPO_CACHE_DIR_V9 = ROOT / "hpo_cache_v9"
+HPO_CACHE_DIR_V10 = ROOT / "hpo_cache_v10"
 
-BASE_NAMES = ["xgb", "lgb", "et", "cubist"]
+BASE_NAMES = ["xgb", "lgb", "et", "cubist", "hgb"]
 TRANSFORM_OPTIONS = ["log1p", "sqrt", "power"]
 
 ELEMENT_GROUPS = [
@@ -249,6 +248,13 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
 
     # Atomic radius ratio max/min (tolerance factor variant)
     new_cols["radius_ratio_max_min"] = ar_range / (ar_mean + 1e-9)
+
+    # BCS-inspired physics features
+    new_cols["ion_polar_proxy"] = ar3 / (np.abs(fie_mean) + 1e-9)
+    debye_val = np.sqrt(fh_mean / (mass_mean + 1e-9))
+    new_cols["el_phonon_coupling"] = (val_mean * dens_mean / (mass_mean + 1e-9)) / (
+        mass_mean * debye_val + 1e-9)
+    new_cols["band_filling"] = val_mean / (n_el_arr + 1e-9)
 
     new_df = pd.DataFrame(new_cols, index=X.index)
     return pd.concat([X, new_df], axis=1)
@@ -541,7 +547,9 @@ def hpo_single_model_cv(model_name, X, y_t, y_orig, n_trials, seed,
     import xgboost as xgb
     from lightgbm import LGBMRegressor
 
-    kf = KFold(n_splits=n_folds, shuffle=True, random_state=seed)
+    # Stratified KFold based on Tc bins for stable CV
+    tc_bins = np.digitize(y_orig, bins=[10, 30, 50, 77])
+    skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=seed)
 
     if model_name == "xgb":
         def obj(trial):
@@ -559,7 +567,7 @@ def hpo_single_model_cv(model_name, X, y_t, y_orig, n_trials, seed,
                 "random_state": seed,
             }
             oof_t = np.zeros(len(y_orig))
-            for fold_i, (tr_idx, va_idx) in enumerate(kf.split(X)):
+            for fold_i, (tr_idx, va_idx) in enumerate(skf.split(X, tc_bins)):
                 X_tr, y_tr_t = X[tr_idx], y_t[tr_idx]
                 if use_smogn:
                     rng = np.random.default_rng(seed + fold_i)
@@ -567,14 +575,20 @@ def hpo_single_model_cv(model_name, X, y_t, y_orig, n_trials, seed,
                         X_tr, y_tr_t, y_orig[tr_idx],
                         threshold=SMOGN_THRESHOLD, boost_ratio=SMOGN_BOOST_RATIO,
                         noise_scale=SMOGN_NOISE_SCALE, rng=rng)
-                m = xgb.XGBRegressor(n_estimators=600, early_stopping_rounds=50, **p)
-                m.fit(X_tr, y_tr_t, eval_set=[(X[va_idx], y_t[va_idx])], verbose=False)
+                try:
+                    m = xgb.XGBRegressor(n_estimators=1500, early_stopping_rounds=50, **p)
+                    m.fit(X_tr, y_tr_t, eval_set=[(X[va_idx], y_t[va_idx])], verbose=False)
+                except Exception:
+                    p_xgb_cpu = {k: v for k, v in p.items() if k != "device"}
+                    p_xgb_cpu["device"] = "cpu"
+                    m = xgb.XGBRegressor(n_estimators=1500, early_stopping_rounds=50, **p_xgb_cpu)
+                    m.fit(X_tr, y_tr_t, eval_set=[(X[va_idx], y_t[va_idx])], verbose=False)
                 oof_t[va_idx] = m.predict(X[va_idx])
                 del m; gc.collect()
             oof_orig = inverse_transform(oof_t, transform_method, pt)
             return np.sqrt(mean_squared_error(y_orig, oof_orig))
 
-        log("  XGBoost HPO (5-fold CV + SMOGN, widened bounds)...")
+        log("  XGBoost HPO (5-fold CV + SMOGN, n_est=1500, stratified)...")
         sampler = optuna.samplers.TPESampler(seed=seed)
 
     elif model_name == "lgb":
@@ -594,7 +608,7 @@ def hpo_single_model_cv(model_name, X, y_t, y_orig, n_trials, seed,
                 "device": "gpu" if LGB_GPU else "cpu",
             }
             oof_t = np.zeros(len(y_orig))
-            for fold_i, (tr_idx, va_idx) in enumerate(kf.split(X)):
+            for fold_i, (tr_idx, va_idx) in enumerate(skf.split(X, tc_bins)):
                 X_tr, y_tr_t = X[tr_idx], y_t[tr_idx]
                 if use_smogn:
                     rng = np.random.default_rng(seed + fold_i)
@@ -603,13 +617,13 @@ def hpo_single_model_cv(model_name, X, y_t, y_orig, n_trials, seed,
                         threshold=SMOGN_THRESHOLD, boost_ratio=SMOGN_BOOST_RATIO,
                         noise_scale=SMOGN_NOISE_SCALE, rng=rng)
                 try:
-                    m = LGBMRegressor(n_estimators=600, early_stopping_rounds=50, **p)
+                    m = LGBMRegressor(n_estimators=1500, early_stopping_rounds=50, **p)
                     m.fit(X_tr, y_tr_t, eval_set=[(X[va_idx], y_t[va_idx])])
                 except Exception:
                     if LGB_GPU:
                         p_cpu = {k: v for k, v in p.items() if k != "device"}
                         p_cpu["device"] = "cpu"
-                        m = LGBMRegressor(n_estimators=600, early_stopping_rounds=50, **p_cpu)
+                        m = LGBMRegressor(n_estimators=1500, early_stopping_rounds=50, **p_cpu)
                         m.fit(X_tr, y_tr_t, eval_set=[(X[va_idx], y_t[va_idx])])
                     else:
                         raise
@@ -618,13 +632,13 @@ def hpo_single_model_cv(model_name, X, y_t, y_orig, n_trials, seed,
             oof_orig = inverse_transform(oof_t, transform_method, pt)
             return np.sqrt(mean_squared_error(y_orig, oof_orig))
 
-        log("  LightGBM HPO (5-fold CV + SMOGN, widened bounds)...")
+        log("  LightGBM HPO (5-fold CV + SMOGN, n_est=1500, stratified)...")
         sampler = optuna.samplers.TPESampler(seed=seed + 1)
 
     elif model_name == "et":
         def obj(trial):
             p = {
-                "n_estimators": 600,
+                "n_estimators": 800,
                 "max_depth": trial.suggest_int("depth", 5, 40),
                 "min_samples_leaf": trial.suggest_int("msl", 1, 20),
                 "min_samples_split": trial.suggest_int("mss", 2, 25),
@@ -633,7 +647,7 @@ def hpo_single_model_cv(model_name, X, y_t, y_orig, n_trials, seed,
                 "n_jobs": -1,
             }
             oof_t = np.zeros(len(y_orig))
-            for fold_i, (tr_idx, va_idx) in enumerate(kf.split(X)):
+            for fold_i, (tr_idx, va_idx) in enumerate(skf.split(X, tc_bins)):
                 X_tr, y_tr_t = X[tr_idx], y_t[tr_idx]
                 if use_smogn:
                     rng = np.random.default_rng(seed + fold_i)
@@ -648,7 +662,7 @@ def hpo_single_model_cv(model_name, X, y_t, y_orig, n_trials, seed,
             oof_orig = inverse_transform(oof_t, transform_method, pt)
             return np.sqrt(mean_squared_error(y_orig, oof_orig))
 
-        log("  ExtraTrees HPO (5-fold CV + SMOGN, widened bounds)...")
+        log("  ExtraTrees HPO (5-fold CV + SMOGN, n_est=800, stratified)...")
         sampler = optuna.samplers.TPESampler(seed=seed + 3)
 
     elif model_name == "cubist":
@@ -664,7 +678,7 @@ def hpo_single_model_cv(model_name, X, y_t, y_orig, n_trials, seed,
             }
             ridge_alpha = trial.suggest_float("cub_ridge_alpha", 0.001, 500.0, log=True)
             oof_t = np.zeros(len(y_orig))
-            for fold_i, (tr_idx, va_idx) in enumerate(kf.split(X)):
+            for fold_i, (tr_idx, va_idx) in enumerate(skf.split(X, tc_bins)):
                 X_tr, y_tr_t = X[tr_idx], y_t[tr_idx]
                 if use_smogn:
                     rng = np.random.default_rng(seed + fold_i)
@@ -681,8 +695,37 @@ def hpo_single_model_cv(model_name, X, y_t, y_orig, n_trials, seed,
             oof_orig = inverse_transform(oof_t, transform_method, pt)
             return np.sqrt(mean_squared_error(y_orig, oof_orig))
 
-        log("  Cubist HPO (ET + Ridge residual, full 30-trial, current feature space)...")
+        log("  Cubist HPO (ET+Ridge, n_est=600, stratified)...")
         sampler = optuna.samplers.TPESampler(seed=seed + 4)
+
+    elif model_name == "hgb":
+        def obj(trial):
+            p = {
+                "max_iter": trial.suggest_int("max_iter", 300, 1500),
+                "max_depth": trial.suggest_int("depth", 3, 10),
+                "learning_rate": trial.suggest_float("lr", 0.01, 0.3, log=True),
+                "min_samples_leaf": trial.suggest_int("msl", 5, 50),
+                "l2_regularization": trial.suggest_float("l2", 0.0, 10.0),
+                "random_state": seed,
+            }
+            oof_t = np.zeros(len(y_orig))
+            for fold_i, (tr_idx, va_idx) in enumerate(skf.split(X, tc_bins)):
+                X_tr, y_tr_t = X[tr_idx], y_t[tr_idx]
+                if use_smogn:
+                    rng = np.random.default_rng(seed + fold_i)
+                    X_tr, y_tr_t, _ = smogn_bagging(
+                        X_tr, y_tr_t, y_orig[tr_idx],
+                        threshold=SMOGN_THRESHOLD, boost_ratio=SMOGN_BOOST_RATIO,
+                        noise_scale=SMOGN_NOISE_SCALE, rng=rng)
+                m = HistGradientBoostingRegressor(**p)
+                m.fit(X_tr, y_tr_t)
+                oof_t[va_idx] = m.predict(X[va_idx])
+                del m; gc.collect()
+            oof_orig = inverse_transform(oof_t, transform_method, pt)
+            return np.sqrt(mean_squared_error(y_orig, oof_orig))
+
+        log("  HistGradientBoosting HPO (5-fold CV + SMOGN, stratified)...")
+        sampler = optuna.samplers.TPESampler(seed=seed + 5)
 
     t = time.time()
     study = optuna.create_study(direction="minimize", sampler=sampler)
@@ -695,42 +738,70 @@ def hpo_single_model_cv(model_name, X, y_t, y_orig, n_trials, seed,
     return {"params": best_params_out, "best_cv_rmse": best_cv_rmse}
 
 
-def train_meta_xgb(oof_matrix, y_orig, y_t, seed, transform_method, pt):
-    """Train shallow XGBoost meta-learner on base model OOF predictions (transformed space).
-
-    Returns (model, meta_pred_orig) where meta_pred_orig is the OOF prediction in original space.
-    """
+def hpo_meta_learner(oof_matrix, y_orig, y_t, seed, transform_method, pt):
+    """25-trial Optuna search for XGBoost meta-learner on OOF predictions."""
     import xgboost as xgb
+
+    def objective(trial):
+        p = {
+            "learning_rate": trial.suggest_float("lr", 0.01, 0.3, log=True),
+            "max_depth": trial.suggest_int("depth", 2, 4),
+            "n_estimators": trial.suggest_int("n_est", 50, 300),
+            "reg_alpha": trial.suggest_float("alpha", 0.01, 50.0, log=True),
+            "reg_lambda": trial.suggest_float("lambda", 0.01, 50.0, log=True),
+            "subsample": trial.suggest_float("subsample", 0.5, 1.0),
+            "colsample_bytree": trial.suggest_float("colsample", 0.5, 1.0),
+            "tree_method": "hist",
+            "device": XGB_DEV,
+            "random_state": seed,
+        }
+        mk = KFold(n_splits=5, shuffle=True, random_state=seed)
+        cv_scores = []
+        for tr_i, va_i in mk.split(oof_matrix):
+            m_cv = xgb.XGBRegressor(**p)
+            m_cv.fit(oof_matrix[tr_i], y_t[tr_i], verbose=False)
+            cv_scores.append(np.sqrt(mean_squared_error(
+                y_orig[va_i], inverse_transform(m_cv.predict(oof_matrix[va_i]), transform_method, pt))))
+            del m_cv; gc.collect()
+        return np.mean(cv_scores)
+
+    sampler = optuna.samplers.TPESampler(seed=seed)
+    study = optuna.create_study(direction="minimize", sampler=sampler)
+    study.optimize(objective, n_trials=25, show_progress_bar=False)
+    bp = study.best_params
+    log(f"    Meta HPO: CV RMSE={study.best_value:.4f}  (depth={bp['depth']}, n={bp['n_est']}, lr={bp['lr']:.4f})")
+
     meta = xgb.XGBRegressor(
-        n_estimators=100, max_depth=2, learning_rate=0.1,
-        reg_alpha=1.0, reg_lambda=5.0,
-        subsample=0.8, colsample_bytree=0.8,
-        tree_method="hist", device=XGB_DEV,
-        random_state=seed,
+        n_estimators=bp["n_est"], max_depth=bp["depth"], learning_rate=bp["lr"],
+        reg_alpha=bp["alpha"], reg_lambda=bp["lambda"],
+        subsample=bp["subsample"], colsample_bytree=bp["colsample"],
+        tree_method="hist", device=XGB_DEV, random_state=seed,
     )
     meta.fit(oof_matrix, y_t, verbose=False)
-    meta_pred_t = meta.predict(oof_matrix)
-    meta_pred_orig = inverse_transform(meta_pred_t, transform_method, pt)
+    meta_pred_orig = inverse_transform(meta.predict(oof_matrix), transform_method, pt)
+    del study; gc.collect()
     return meta, meta_pred_orig
 
 
-def run_stacking_cv(X, y_t, y_orig, params, n_folds=10, seed=42,
+def run_stacking_cv(X, y_t, y_orig, params, seed=42,
                     transform_method="log1p", pt=None):
     import xgboost as xgb
     from lightgbm import LGBMRegressor
 
-    kf = KFold(n_splits=n_folds, shuffle=True, random_state=seed)
+    # Repeated 5×2-fold CV for stable OOF estimates
+    cv = RepeatedKFold(n_splits=5, n_repeats=2, random_state=seed)
     n = len(y_orig)
 
     oof_t = {name: np.zeros(n) for name in BASE_NAMES}
 
     n_iters = {
-        "xgb": 600, "lgb": 600,
-        "et":      params["et"].get("n_estimators", 600),
+        "xgb": 1500, "lgb": 1500,
+        "et":      params["et"].get("n_estimators", 800),
         "cubist":  600,
+        "hgb":     params["hgb"].get("max_iter", 1000),
     }
 
-    for fold_i, (tr_idx, va_idx) in enumerate(kf.split(X)):
+    for fold_i, (tr_idx, va_idx) in enumerate(cv.split(X)):
         t0 = time.time()
         X_tr, X_va = X[tr_idx], X[va_idx]
         y_tr_t, y_va_t = y_t[tr_idx], y_t[va_idx]
@@ -760,10 +831,17 @@ def run_stacking_cv(X, y_t, y_orig, params, n_folds=10, seed=42,
             "max_features": params["et"]["mf"],
         }
 
-        m = xgb.XGBRegressor(n_estimators=n_iters["xgb"], tree_method="hist",
-                              device=XGB_DEV, random_state=seed,
-                              early_stopping_rounds=50, **p_xgb)
-        m.fit(X_tr, y_tr_t, eval_set=[(X_va, y_va_t)], verbose=False)
+        try:
+            m = xgb.XGBRegressor(n_estimators=n_iters["xgb"], tree_method="hist",
+                                  device=XGB_DEV, random_state=seed,
+                                  early_stopping_rounds=50, **p_xgb)
+            m.fit(X_tr, y_tr_t, eval_set=[(X_va, y_va_t)], verbose=False)
+        except Exception:
+            p_xgb_cpu = {k: v for k, v in p_xgb.items() if k != "device"}
+            m = xgb.XGBRegressor(n_estimators=n_iters["xgb"], tree_method="hist",
+                                  device="cpu", random_state=seed,
+                                  early_stopping_rounds=50, **p_xgb_cpu)
+            m.fit(X_tr, y_tr_t, eval_set=[(X_va, y_va_t)], verbose=False)
         n_iters["xgb"] = max(n_iters["xgb"], int(m.best_iteration) + 10)
         oof_t["xgb"][va_idx] = m.predict(X_va)
         del m; gc.collect()
@@ -805,6 +883,19 @@ def run_stacking_cv(X, y_t, y_orig, params, n_folds=10, seed=42,
         oof_t["cubist"][va_idx] = et_cub.predict(X_va) + ridge_cub.predict(X_va)
         del et_cub, ridge_cub; gc.collect()
 
+        p_hgb = {
+            "max_iter": n_iters["hgb"],
+            "max_depth": params["hgb"]["depth"],
+            "learning_rate": params["hgb"]["lr"],
+            "min_samples_leaf": params["hgb"]["msl"],
+            "l2_regularization": params["hgb"]["l2"],
+            "random_state": seed,
+        }
+        m_hgb = HistGradientBoostingRegressor(**p_hgb)
+        m_hgb.fit(X_tr, y_tr_t)
+        oof_t["hgb"][va_idx] = m_hgb.predict(X_va)
+        del m_hgb; gc.collect()
+
         blend_t = np.mean([oof_t[name][va_idx] for name in BASE_NAMES], axis=0)
         fold_rmse = np.sqrt(mean_squared_error(y_orig[va_idx],
                                                inverse_transform(blend_t, transform_method, pt)))
@@ -812,8 +903,8 @@ def run_stacking_cv(X, y_t, y_orig, params, n_folds=10, seed=42,
 
     base_oof_t = np.column_stack([oof_t[name] for name in BASE_NAMES])
 
-    log("\n  Training XGBoost meta-learner (depth=2, n=100, strong reg)...")
-    meta_model, oof_stack_orig = train_meta_xgb(
+    log("\n  Training HPO-optimized XGBoost meta-learner (25-trial)...")
+    meta_model, oof_stack_orig = hpo_meta_learner(
         base_oof_t, y_orig, y_t, seed, transform_method, pt)
     rmse, mae, r2 = get_metrics(y_orig, oof_stack_orig)
     log(f"  Stack OOF: RMSE={rmse:.4f}  MAE={mae:.4f}  R2={r2:.4f}")
@@ -831,9 +922,9 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--train_data", default="data/ml_train.csv")
     parser.add_argument("--elem_data",  default="data/unique_m_train.csv")
-    parser.add_argument("--model_path", default="model_v9.pkl")
+    parser.add_argument("--model_path", default="model_v10.pkl")
     parser.add_argument("--n_trials",   type=int, default=35,
-                        help="Default max n_trials; per-model overrides: XGB=25, LGB=25, ET=20, Cubist=20")
+                        help="Default max n_trials; per-model overrides: XGB=25, LGB=25, ET=20, Cubist=10, HGB=10")
     parser.add_argument("--no_cache",   action="store_true",
                         help="Skip HPO cache and re-run all hyperparameter searches")
     args = parser.parse_args()
@@ -841,17 +932,17 @@ def main():
     t_all = time.time()
     with open(LOG_FILE, "w", encoding="utf-8") as f:
         f.write("")
-    log(f"[{time.strftime('%H:%M:%S')}] Starting train_v9.py (Stacking Ensemble v9 — XGBoost Meta + 90/10 Split)")
+    log(f"[{time.strftime('%H:%M:%S')}] Starting train_v10.py (Stacking Ensemble v10 — HPO Meta + HGB + 5-model)")
     log(f"  Multi-seed: {SEEDS}")
     lgb_dev = "gpu(try)" if LGB_GPU else "CPU"
-    log(f"  XGB={XGB_DEV}, LGB={lgb_dev}, ET=CPU, Cubist=CPU")
-    log(f"  Base models: XGB + LGB + ET + Cubist → XGBoost meta (depth=2, n=100)")
-    log(f"  SMOGN boost: {SMOGN_BOOST} (threshold={SMOGN_THRESHOLD}K, ratio={SMOGN_BOOST_RATIO}, noise={SMOGN_NOISE_SCALE})")
-    log(f"  Corr thresh: 0.95  |  Post-processing: IsotonicRegression calibration")
-    log(f"  HPO cache: hpo_cache_v9/ (v8 warm-start, full re-optimization in current feature space)")
-    log(f"  HPO: XGB=25, LGB=25, ET=20, Cubist=20 trials  |  90/10 split (no Val set)")
+    log(f"  XGB={XGB_DEV}, LGB={lgb_dev}, ET=CPU, Cubist=CPU, HGB=CPU")
+    log(f"  Base models: XGB + LGB + ET + Cubist + HGB (5 models, algorithm diversity)")
+    log(f"  SMOGN boost: {SMOGN_BOOST} (threshold={SMOGN_THRESHOLD}K, ratio={SMOGN_BOOST_RATIO})")
+    log(f"  Corr thresh: 0.95  |  Meta: HPO-optimized XGBoost (25-trial)  |  Calibration: IsotonicRegression")
+    log(f"  HPO cache: hpo_cache_v10/  |  Stratified KFold + Repeated 5×2-fold CV")
+    log(f"  HPO: XGB=25/LGB=25/ET=20/Cubist=10/HGB=10 trials, n_est=1500/1000")
 
-    HPO_CACHE_DIR_V9.mkdir(exist_ok=True)
+    HPO_CACHE_DIR_V10.mkdir(exist_ok=True)
 
     log("\n" + "=" * 55)
     log("STEP 0  | Load data")
@@ -974,7 +1065,7 @@ def main():
     all_test_preds   = []
     all_train_preds  = []
 
-    checkpoint_file = ROOT / "_checkpoint_v9.pkl"
+    checkpoint_file = ROOT / "_checkpoint_v10.pkl"
     if checkpoint_file.exists():
         try:
             ck = joblib.load(checkpoint_file)
@@ -999,28 +1090,28 @@ def main():
         log("=" * 55)
 
         log(f"\n{'=' * 55}")
-        log(f"STEP 1  | Optuna HPO (XGB=25, LGB=25, ET=20, Cubist=20 trials, 5-fold CV + SMOGN)")
+        log(f"STEP 1  | Optuna HPO (XGB=25, LGB=25, ET=20, Cubist=10, HGB=10 trials, stratified 5-fold)")
         log("=" * 55)
-        TRIAL_MAP = {"xgb": 25, "lgb": 25, "et": 20, "cubist": 20}
+        TRIAL_MAP = {"xgb": 25, "lgb": 25, "et": 20, "cubist": 10, "hgb": 10}
         all_params = {}
         for model_name in BASE_NAMES:
-            cache_file = HPO_CACHE_DIR_V9 / f"{best_transform}_seed{seed}_{model_name}.json"
+            cache_file = HPO_CACHE_DIR_V10 / f"{best_transform}_seed{seed}_{model_name}.json"
             if (not args.no_cache) and cache_file.exists():
                 cached = json.loads(cache_file.read_text())
                 all_params[model_name] = cached["params"]
                 log(f"  [{model_name}] loaded from cache  (RMSE={cached['best_cv_rmse']:.4f})")
                 continue
 
-            # All models: warm-start from v8 cache, then refine in current feature space
+            # Warm-start from v9 cache, refine in current feature space
             warm_params_list = None
             n_trials_model = TRIAL_MAP[model_name]
-            v8_cache = HPO_CACHE_DIR_V8 / f"{best_transform}_seed{seed}_{model_name}.json"
-            if v8_cache.exists():
-                v8_data = json.loads(v8_cache.read_text())
-                warm_params_list = [v8_data["params"]]
-                log(f"  [{model_name}] v8 warm-start loaded (v8 CV RMSE={v8_data['best_cv_rmse']:.4f}), refining {n_trials_model} trials")
+            v9_cache = HPO_CACHE_DIR_V9 / f"{best_transform}_seed{seed}_{model_name}.json"
+            if model_name != "hgb" and v9_cache.exists():
+                v9_data = json.loads(v9_cache.read_text())
+                warm_params_list = [v9_data["params"]]
+                log(f"  [{model_name}] v9 warm-start loaded (v9 CV RMSE={v9_data['best_cv_rmse']:.4f}), refining {n_trials_model} trials")
             else:
-                log(f"  [{model_name}] no v8 cache found, running full {n_trials_model} trials")
+                log(f"  [{model_name}] no v9 cache / new model, running full {n_trials_model} trials")
 
             try:
                 result = hpo_single_model_cv(
@@ -1041,11 +1132,11 @@ def main():
             gc.collect()
 
         log(f"\n{'=' * 55}")
-        log(f"STEP 2  | 10-fold Stacking CV (seed={seed}, on Train split only)")
+        log(f"STEP 2  | Repeated 5×2-fold Stacking CV (seed={seed})")
         log("=" * 55)
         try:
             cv_result = run_stacking_cv(
-                X_train_sel, y_train_t, y_train, n_folds=10, seed=seed,
+                X_train_sel, y_train_t, y_train, seed=seed,
                 transform_method=best_transform, params=all_params, pt=best_power_pt)
         except Exception as e:
             log(f"  ERROR in stacking CV: {e}")
@@ -1097,10 +1188,27 @@ def main():
                 max_features=all_params["cubist"]["cub_mf"]),
             "cubist_ridge": Ridge(
                 alpha=all_params["cubist"]["cub_ridge_alpha"], random_state=seed),
+            "hgb": HistGradientBoostingRegressor(
+                max_iter=n_iters["hgb"],
+                max_depth=all_params["hgb"]["depth"],
+                learning_rate=all_params["hgb"]["lr"],
+                min_samples_leaf=all_params["hgb"]["msl"],
+                l2_regularization=all_params["hgb"]["l2"],
+                random_state=seed),
         }
 
-        for name in ["xgb", "lgb", "et", "cubist_et", "cubist_ridge"]:
-            if name == "lgb":
+        for name in ["xgb", "lgb", "et", "cubist_et", "cubist_ridge", "hgb"]:
+            if name == "xgb":
+                try:
+                    final_models[name].fit(X_train_sel, y_train_t)
+                except Exception:
+                    log("  [XGB] GPU unavailable, falling back to CPU")
+                    p_xgb_cpu = {k: v for k, v in all_params["xgb"].items() if k != "device"}
+                    final_models[name] = xgb.XGBRegressor(
+                        n_estimators=n_iters["xgb"], tree_method="hist", device="cpu",
+                        random_state=seed, **p_xgb_cpu)
+                    final_models[name].fit(X_train_sel, y_train_t)
+            elif name == "lgb":
                 try:
                     final_models[name].fit(X_train_sel, y_train_t)
                 except Exception:
@@ -1136,6 +1244,8 @@ def main():
                 if name == "cubist":
                     base_preds_t["cubist"] = (final_models["cubist_et"].predict(X_split) +
                                               final_models["cubist_ridge"].predict(X_split))
+                elif name == "hgb":
+                    base_preds_t["hgb"] = final_models["hgb"].predict(X_split)
                 else:
                     base_preds_t[name] = final_models[name].predict(X_split)
 
@@ -1235,7 +1345,7 @@ def main():
         "train_rmse": best_rmse_train,
         "best_method": best_method,
         "seeds": SEEDS,
-        "method": "multi_seed_stacking_v9",
+        "method": "multi_seed_stacking_v10",
         "transform_method": best_transform,
         "power_pt": best_power_pt,
         "isotonic_reg": ir_calibrator,
@@ -1249,19 +1359,19 @@ def main():
         raise
 
     log("\n" + "=" * 55)
-    log("FINAL RESULTS (v9 — XGBoost Meta + 90/10 Split + Full HPO + Calibration)")
+    log("FINAL RESULTS (v10 — 5-model + HPO Meta + HGB + Stratified CV)")
     log("=" * 55)
-    log(f"  Features:       {len(feature_cols)}")
+    log(f"  Features:       {len(feature_cols)} (+3 BCS: ion_polar_proxy, el_phonon_coupling, band_filling)")
     log(f"  Element features: merged from unique_m_train.csv + Mendeleev/VEC/PCA")
-    log(f"  Base models:   XGB + LGB + ET + Cubist (4 models)")
-    log(f"  Meta:          XGBoost (depth=2, n=100, alpha=1.0, lambda=5.0, subsample=0.8)")
-    log(f"  Split:         90/10 (Val removed, +1,701 training samples)")
+    log(f"  Base models:   XGB + LGB + ET + Cubist + HGB (5 models, added HGB)")
+    log(f"  Meta:          XGBoost HPO-optimized (25-trial search on OOF predictions)")
+    log(f"  CV strategy:   Stratified KFold (HPO) + Repeated 5×2-fold (stacking)")
     log(f"  Seeds:         {SEEDS}")
     log(f"  Transform:     {best_transform}")
     log(f"  SMOGN boost:   {SMOGN_BOOST} (threshold={SMOGN_THRESHOLD}K, ratio={SMOGN_BOOST_RATIO})")
     log(f"  Corr thresh:   0.95  |  Calibration: IsotonicRegression")
-    log(f"  HPO trials:    XGB=25, LGB=25, ET=20, Cubist=20 (v8 warm-start, current space)")
-    log(f"  Best method:   {best_method}  (3-seed ensemble, no Val-based selection)")
+    log(f"  HPO:           XGB=25/LGB=25/ET=20/Cubist=10/HGB=10, n_est=1500/800/600 (GPU fallback for XGB/LGB)")
+    log(f"  Best method:   {best_method}  (3-seed ensemble, always ensemble)")
     log(f"  Train RMSE:    {best_rmse_train:.4f}")
     log(f"  Test  RMSE:    {best_rmse_test:.4f}  MAE: {best_mae_test:.4f}  R2: {best_r2_test:.4f}")
     log(f"  Total time:    {time.time()-t_all:.0f}s")

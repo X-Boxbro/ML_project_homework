@@ -2,7 +2,7 @@
 超导临界温度回归 — 版本更新优化说明
 ================================================================================
 
-本说明详细记录了从 train_v1.py 到 train_v9.py 共 9 个版本的实验演进过程，
+本说明详细记录了从 train_v1.py 到 train_v10.py 共 10 个版本的实验演进过程，
 涵盖架构设计、特征工程、超参数优化、元学习器和评估策略的逐步改进。
 
 注意：文件命名 train_v1~v9 是按实验先后顺序排列，但各文件内部的 docstring
@@ -761,77 +761,224 @@ v6 的最大贡献是证明了：即使 CatBoost 单模型表现不佳，它在�
 
 
 ================================================================================
+版本 10 — train_v10.py：「HGB 第5基模型 + 元学习器 HPO + 分层CV + BCS特征」
+================================================================================
+
+【内部标识】Stacking Ensemble v10
+【架构】XGB + LGB + ExtraTrees + Cubist + HistGradientBoosting (5 基模型)
+     → XGBoost Meta-learner (HPO 25-trial 优化) + IsotonicRegression 校准
+
+【相对于 v9 的核心变更】
+
+1. 新增第 5 基模型：HistGradientBoostingRegressor (HGB)
+   - sklearn 原生的基于直方图的梯度提升树，与 LightGBM 算法同源但实现不同
+   - 提供"算法多样性"：HGB 使用不同的分裂策略和正则化方式
+   - HPO 参数：
+     * max_iter[300, 1500]、max_depth[3, 10]、learning_rate[0.01, 0.3]
+     * min_samples_leaf[5, 50]、l2_regularization[0, 10]
+   - 纯 CPU 实现，无 GPU 依赖，可移植性好
+   - HPO CV RMSE ≈ 9.64-9.66，是 5 个基模型中表现最差的
+     但与早期 CatBoost 的情况类似，弱模型在堆叠中仍有互补价值
+
+2. 元学习器 HPO 优化——从固定参数到搜索最优配置
+   v9 的 XGBoost 元学习器参数是人工设定的（depth=2, n=100, lr=0.1,
+   alpha=1.0, lambda=5.0）。v10 对元学习器进行 25-trial Optuna 搜索：
+   - 搜索空间：depth[2, 4]、n_est[50, 300]、lr[0.01, 0.3]
+   - reg_alpha[0.01, 50]、reg_lambda[0.01, 50]
+   - subsample[0.5, 1.0]、colsample[0.5, 1.0]
+   - 在基模型 OOF 预测矩阵上做 5-fold CV
+   - 搜索到的配置因种子而异（如 seed 123: depth=3, n=231, lr=0.0504；
+     seed 2026: depth=2, n=267, lr=0.0344），说明元学习器的最优配置
+     确实与基模型的预测模式相关
+   - 这一改进使元学习器从"手工设计"进化为"数据驱动"
+
+3. HPO n_estimators 大幅提升——给模型更多容量
+   - XGB: 600 → 1500（×2.5）
+   - LGB: 600 → 1500（×2.5）
+   - ET: 600 → 800（×1.33）
+   - Cubist ET: 600 → 600（不变）
+   - 配合 early_stopping_rounds=50，实际迭代数仍受早停控制
+   - 更大的 n_estimators 上限给了 Optuna 探索更深拟合空间的自由度
+
+4. Stratified KFold 用于 HPO——Tc 分层保证每 fold 代表性强
+   - 将 Tc 按分位数划分为 5 个 bin：[10, 30, 50, 77]
+   - 使用 StratifiedKFold 确保每个 fold 中 Tc 分布一致
+   - 对比之前版本的普通 KFold：分层保证了高 Tc 和低 Tc 样本
+     在各 fold 中均匀分布，HPO 评估更加稳定可靠
+   - 新增 tc_bins = np.digitize(y_orig, bins=[10, 30, 50, 77])
+
+5. Repeated 5×2-fold CV 用于 Stacking——替代 10-fold
+   - v8-v9 使用 10-fold CV（每 fold 90% 训练，10% 验证）
+   - v10 使用 RepeatedKFold(n_splits=5, n_repeats=2)，共 10 个 fold
+   - 每个 fold 的验证集比例更大（5-fold: 80/20 vs 10-fold: 90/10），
+     每个基模型在 OOF 生成时看到更多的验证样本
+   - 2 次重复增加了 OOF 的统计稳定性
+   - 日志确认 fold 间 Blend RMSE 更加均匀（不再出现 8.05-10.47
+     这样的极端方差）
+
+6. 3 个 BCS 理论启发的物理特征——v10 的特征工程增量
+   v9 的特征集在 v7 后没有扩展，v10 新增了 3 个基于 BCS 超导理论的
+   物理代理特征：
+   - ion_polar_proxy = ar³ / |fie_mean|
+     * 离子极化率代理：原子半径³除以第一电离能
+     * 反映晶格中离子的可极化程度
+   - el_phonon_coupling = (val_mean × dens_mean / mass_mean) /
+     (mass_mean × debye_val)
+     * 电子-声子耦合强度代理（BCS 理论的核心参数 λ）
+     * 分子是价电子密度，分母是质量×德拜温度
+     * 直观物理含义：轻原子 + 低德拜温度 → 强耦合
+   - band_filling = val_mean / n_elements
+     * 能带填充代理：每个元素的平均价电子数
+     * 反映费米面附近的电子态密度
+   - 原始特征数：206 → 209（+3 BCS 特征）
+   - 特征选择后：166（vs v9: 163，+3 BCS 特征保留）
+   - PCA 后：181（vs v9: 178，+3）
+
+7. GPU fallback 扩展到 XGB
+   - v9 仅 LGB 有 GPU fallback 容错
+   - v10 为 XGB 也增加了 GPU→CPU fallback（在 HPO 和 Stacking CV 中）
+   - 增强了跨平台可移植性
+
+8. 各模型 HPO trial 数差异化调整
+   - v9：XGB=25, LGB=25, ET=20, Cubist=20（4 个模型）
+   - v10：XGB=25, LGB=25, ET=20, Cubist=10, HGB=10（新增 HGB）
+   - Cubist 从 20 降到 10（复用 v9 warm start 精调即可）
+   - HGB 首次搜索 10 trials（无历史缓存）
+   - 总 HPO trial 数：v9 为 90/seed，v10 为 90/seed（持平）
+
+9. 全局重命名 v9 → v10
+   - LOG_FILE → training_log_v10.txt
+   - MODEL_PATH → model_v10.pkl
+   - HPO_CACHE_DIR → hpo_cache_v10/
+   - checkpoint_file → _checkpoint_v10.pkl
+   - HPO_CACHE_DIR_V9 用于 warm start 加载
+
+【训练结果（v10 vs v9 对比）】
+- 集成 Test RMSE:     8.8345 (vs v9: 8.8462) ↓ 0.01 —— 边际改进
+- 校准前 Test RMSE:   8.8239 (vs v9 校准前: 8.8676) ↓ 0.04 —— 实打实的提升！
+- 校准后 Test RMSE:   8.8345 (vs v9: 8.8462) ↓ 0.01
+- Test R²:           0.9324 (vs v9: 0.9322)
+- Test MAE:          4.7544 (vs v9: 4.7744) ↓ 0.02
+- Train RMSE:        4.6658 (vs v9: 4.8106) ↓ 0.14 —— 训练集拟合更强
+- Test-Train Gap:    4.1688 (vs v9: 4.0356) ↑ 0.13 —— 过拟合略增
+- 各单种子 Test RMSE: 8.86/8.87/8.85（vs v9: 8.88/8.96/8.89），
+  单种子方差更小
+- 总耗时：10007s（~2.8 小时，vs v9: 11109s）↓ 10%
+
+关键观察：
+
+1. IsotonicRegression 校准在 v10 中出现了轻微负效果：
+   - 校准前 Test RMSE = 8.8239，校准后 Test RMSE = 8.8345（变差了 0.01）
+   - 这与 v9 中校准始终有益（8.8676→8.8462）形成对比
+   - 原因可能是：v10 的 3-seed 集成预测已经非常准确，保序回归
+     无法在"几乎完美"的排序上找到有意义的调整
+   - 这也说明 IsotonicRegression 校准的效果取决于模型本身的校准程度
+
+2. HGB 基模型表现分析：
+   - HGB CV RMSE 为 9.64-9.66，是 5 个基模型中最差的
+   - 但其在集成中的贡献不能仅从 CV RMSE 判断
+   - XGBoost 元学习器通过非线性混合，可以学会仅在 HGB 有把握时
+     给予其权重（类似于 v7 SLSQP 对 CatBoost 的自动剪枝，但更精细）
+
+3. 元学习器 HPO 发现：
+   - 不同 seed 搜索到不同的最优参数组合
+   - Seed 123: depth=3, n=231, lr=0.05（更深更大的树）
+   - Seed 2026: depth=2, n=267, lr=0.03（浅树但更多棵）
+   - 这说明最优元学习器配置确实依赖基模型的预测特性，不能一刀切
+
+4. 边际收益进一步递减：
+   - v9→v10 的 Test RMSE 降幅（0.01）与 v8→v9（0.09）相比极小
+   - 校准前对比 8.824 vs 8.868（↓0.04）说明基础模型确实更好，
+     但校准步骤的退步部分抵消了这一优势
+   - 累计从 v3 的 9.47 到 v10 的 8.83，共下降 6.7%
+
+5. Stratified KFold + Repeated CV 的效果：
+   - Fold 间 Blend RMSE 更加紧凑（如 seed 2026: 8.88-9.97），
+     没有出现 v8 那样的极端值 8.05
+   - 验证了分层 CV 在 Tc 分布不均匀情况下的价值
+
+6. LGB HPO 时间问题：
+   - LGB 25 trials with n_est=1500: 2297-2524s，是单个模型中最慢的
+   - 与 n_estimators 增加到 1500 + stratified 5-fold 有关
+   - 相比之下 HGB 10 trials 仅 ~150-250s，非常快
+
+7. 架构收敛判断：
+   经过 10 个版本的迭代，v10 在 v9 的基础上做了多项增量改进
+   （HGB、元学习器 HPO、分层 CV、BCS 特征、GPU 容错），但总体
+   Test RMSE 仅从 8.846 降至 8.835。这表明当前"树模型堆叠 +
+   变换空间"的框架可能已经接近数据集的信息上限。未来的突破方向
+   可能需要：
+   - 全新的特征来源（如晶体结构真正参数、合成条件）
+   - 深度学习架构（如 TabNet、FT-Transformer）
+   - 不同损失函数（如分位数损失、Huber 损失）
+   - 伪标签 / 自训练（利用更多未标注的超导数据）
+
+
+================================================================================
 版本迭代总览：核心改进脉络
 ================================================================================
 
 ┌────────┬──────────────┬───────────────────────────────────────┐
 │ 版本   │ Test RMSE    │ 核心实验主题                           │
-│        │ (最佳种子)    │                                       │
+│        │ (3-seed集成) │                                       │
 ├────────┼──────────────┼───────────────────────────────────────┤
-│  v3    │   9.3953     │ 基线：5模型堆叠 + SMOGN + 变换空间     │
-│  v4    │   9.0769     │ ↓ 引入元素组成特征，移除不济的CatBoost  │
-│  v5    │   9.0389     │ ↓ 收紧HPO正则化 + 物理FE + PCA降维     │
-│  v6    │   9.0053     │ ↓ 回归CatBoost + 周期表FE + 更大HPO    │
-│  v7    │   8.9455     │ ↓ 5模型 + SLSQP约束混合最优权重        │
-│  v8    │   8.9344     │ ↓ 4模型回归 + SLSQP多启动 + 10-fold    │
+│  v3    │   9.4681     │ 基线：5模型堆叠 + SMOGN + 变换空间     │
+│  v4    │   9.1275     │ ↓ 引入元素组成特征，移除不济的CatBoost  │
+│  v5    │   9.0321     │ ↓ 收紧HPO正则化 + 物理FE + PCA降维     │
+│  v6    │   8.9807     │ ↓ 回归CatBoost + 周期表FE + 更大HPO    │
+│  v7    │   8.9487     │ ↓ 5模型 + SLSQP约束混合最优权重        │
+│  v8    │   8.9365     │ ↓ 4模型回归 + SLSQP多启动 + 10-fold    │
 │  v9    │   8.8462     │ ↓ XGBoost非线形元学习器 + 全HPO + 校准  │
-│        │ (3-seed集成) │   (v9起固定输出集成，不再选单种子)      │
+│  v10   │   8.8345     │ ↓ +HGB模型 + 元学习器HPO + 分层CV      │
+│        │ (预校准8.824)│   (BCS物理特征 + GPU容错)              │
 └────────┴──────────────┴───────────────────────────────────────┘
 
-Test RMSE 从 9.40 降至 8.85，累计下降 5.9%。
+Test RMSE 从 9.47 降至 8.83，累计下降 6.7%。
 
-1. 数据划分与评估（v1 → v9）
+1. 数据划分与评估（v1 → v10）
    - v1：简单 80/20 分割 → 不严谨
    - v3-v8：8:1:1 标准化划分 + Val 用于模型选择
-   - v9：90/10 划分，移除 Val，固定 3-seed 集成，更多训练数据
+   - v9-v10：90/10 划分，移除 Val，固定 3-seed 集成
 
-2. 特征工程（v1 → v9，特征数 169 → 206 原始 / 178 最终）
+2. 特征工程（v1 → v10，特征数 169 → 209 原始 / 181 最终）
    - v1：仅 ml_train.csv 的基础统计特征 + 简单比率
    - v2：大量物理交互特征（热电交叉、非线性变换）
    - v4：元素组成特征（86 元素分数 + 超导家族标识）
    - v5：Mendeleev 数 + VEC + 稀疏 PCA
    - v6：周期表 Group/Period 坐标
-   - v7-v9：Debye 温度代理 + 容差因子（特征集稳定）
+   - v7-v9：Debye 温度代理 + 容差因子
+   - v10：BCS 理论特征（离子极化、电子-声子耦合、能带填充）
 
-3. 基模型架构（v1 → v9）
+3. 基模型架构（v1 → v10）
    - v1：4 模型（XGB/LGB/CAT/ET）
    - v2：5 模型（+Cubist）
-   - v4：4 模型（-CatBoost，因性能差）
-   - v6：4 模型（+CatBoost 回归，-Cubist）
-   - v7：5 模型（Cubist 回归，CatBoost 保留但被 SLSQP 清零）
-   - v8-v9：4 模型（-CatBoost，已被多个版本验证不需要）
-   - 最终共识：XGB + LGB + ET + Cubist 是经过 9 轮验证的最优组合
+   - v4：4 模型（-CatBoost）
+   - v6：4 模型（+CatBoost，-Cubist）
+   - v7：5 模型（全部保留，但 CatBoost 被 SLSQP 清零）
+   - v8-v9：4 模型（-CatBoost，XGB+LGB+ET+Cubist）
+   - v10：5 模型（+HGB，算法多样性，XGB+LGB+ET+Cubist+HGB）
+   - 最终共识：树模型的算法多样性有价值，5 模型 > 4 模型
 
-4. 元学习器（v1 → v9）——变化最大的维度
+4. 元学习器——演变最大的维度（v1 → v10）
    - v1：sklearn StackingRegressor（RidgeCV，原始空间）
-   - v2-v6：BayesianRidge/Ridge/ShallowRF/NNLS 竞争选择
-   - v7：SLSQP 约束混合（线性加权 + 单起点）
-   - v8：SLSQP 约束混合（线性加权 + 3 起点 multi-start）
-   - v9：XGBoost 非线性元学习器（depth=2 树，突破线性加权的天花板）
+   - v2-v6：BayesianRidge/Ridge/ShallowRF/NNLS 竞争
+   - v7-v8：SLSQP 约束混合（线性加权）
+   - v9：XGBoost 非线性元学习器（手工参数）
+   - v10：XGBoost 非线性元学习器（HPO 优化参数）
 
-5. 正则化与过拟合（v4 → v9）
-   - v4：Train-Val gap = 5.13 → 严重过拟合
-   - v5：收紧 HPO + 强正则化 → gap 降至 4.13
-   - v7：gap 稳定在 4.24
-   - v8：gap = 4.50 → 拓宽 HPO 后略有回升
-   - v9：Test-Train gap ≈ 4.04（与 v8 的 Test-Train~4.19 相比更低）
-
-6. SMOGN 策略演进（v1 → v9）
-   - v1：无 SMOGN
-   - v2-v8：阈值 77K，比例 1.5
-   - v9：阈值 50K，比例 2.0（更激进的中高温区域增强）
-
-7. CV 策略演进（v1 → v9）
-   - v1-v2：5-fold
+5. CV 策略演进（v1 → v10）
+   - v1-v2：普通 5-fold
    - v3-v7：5-fold（在 Train split 内）
-   - v8-v9：10-fold（在 v9 的 90% Train 集内，每 fold 更稳定）
+   - v8-v9：普通 10-fold
+   - v10：HPO 用 Stratified 5-fold + Stacking 用 Repeated 5×2-fold
 
-8. 训练效率
+6. 训练效率
    - v3：1272s（全缓存）
-   - v6：31292s（CatBoost HPO 耗时巨大）
-   - v7：2185s（复用缓存 + Cubist 快速精调）
-   - v8：3861s（Cubist 完整 HPO + 10-fold CV）
-   - v9：11109s（全模型完整 HPO + 10-fold CV，约 3 小时）
+   - v6：31292s（CatBoost 瓶颈）
+   - v7：2185s（高效）
+   - v8：3861s
+   - v9：11109s（全模型完整 HPO）
+   - v10：10007s（略低于 v9，LGB n_est=1500 但 trial 数不变）
 
 
 ================================================================================

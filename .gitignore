@@ -1,5 +1,5 @@
 # HPO results cache (auto-generated, safe to delete)
-hpo_cache_v9/
+hpo_cache_v10/
 
 # Trained model files
 *.pkl
