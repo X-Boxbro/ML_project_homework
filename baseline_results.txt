@@ -1,0 +1,5 @@
+train shape: (17010, 82), test shape: (4253, 82)
+target mean/std in train: 34.480 / 34.248
+rmse: 10.2201
+mae: 6.2628
+r2: 0.9111

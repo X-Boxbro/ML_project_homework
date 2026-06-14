@@ -1,0 +1,841 @@
+================================================================================
+超导临界温度回归 — 版本更新优化说明
+================================================================================
+
+本说明详细记录了从 train_v1.py 到 train_v9.py 共 9 个版本的实验演进过程，
+涵盖架构设计、特征工程、超参数优化、元学习器和评估策略的逐步改进。
+
+注意：文件命名 train_v1~v9 是按实验先后顺序排列，但各文件内部的 docstring
+版本号（v3/v4/v5等）可能不一致，这是实验过程中对不同分支的标记约定。
+
+关键评估指标（统一比较）：
+- 数据集：17010 条超导材料样本
+- 评估方式：8:1:1 Train/Val/Test（v3-v8）或 90/10 Train/Test（v9）
+- 多种子（3 seeds）：[42, 123, 2026]
+- 目标变换：自适应选择 log1p/sqrt/power
+- SMOGN 提升：v1-v8 为 Tc>77K×1.5 倍，v9 改为 Tc>50K×2.0 倍
+
+
+================================================================================
+版本 1 — train_v1.py：「sklearn StackingRegressor + 原始空间训练」
+================================================================================
+
+【内部标识】Stacking Ensemble v4
+【架构】XGB + LightGBM + CatBoost + ExtraTrees (4 个基模型) → RidgeCV/Lasso 元学习器
+
+【主要特征】
+- 使用 sklearn 内置的 StackingRegressor（而非自实现的手动堆叠）
+- 在原始目标空间（未经 log/sqrt/power 变换）中训练，避免对数变换导致
+  CV/HPO 评估不一致的问题
+- 引入 ExtraTrees 作为第 4 个基学习器
+- 添加了 20 个物理启发式特征工程（如 cv_、range_over_mean_、
+  gm_over_am_、norm_entropy_、wtd_vs_mean_ 等比率特征，以及
+  fie×ea、fie+ea、tc×dens 等交互特征）
+- 特征选择：VarianceThreshold(0.001) + 高相关性剔除(corr_thresh=0.98)
+- Optuna HPO：25 trials/模型，各模型独立搜索空间
+- 无训练日志文件保存（使用默认 training_log.txt，未保留）
+
+【与后续版本的差异】
+- 无 SMOGN 增广（高 Tc 样本少的问题未处理）
+- 无元素组成特征（仅使用 ml_train.csv 的统计特征）
+- 无多种子集成
+- 无 train/val/test 划分（仅 80/20 简单分割）
+- 元学习器仅为 RidgeCV（无 BayesianRidge/ShallowRF/NNLS）
+- HPO 仅在单 fold 上搜索（非 5-fold CV）
+
+【此版本的地位】作为该实验系列的起点，验证了 sklearn StackingRegressor
+在原始空间训练的基本可行性，但该路线在后续版本中被放弃，转而使用自实现的
+变换空间堆叠方案。
+
+
+================================================================================
+版本 2 — train_v2.py：「空间统一的变换空间堆叠 + 多种子集成」
+================================================================================
+
+【内部标识】Stacking Ensemble v3 (Space-Unified)
+【架构】XGB + LGB + CatBoost + ExtraTrees + Cubist (5 个基模型)
+     → BayesianRidge + Ridge + ShallowRF(深度=3) 元学习器
+
+【相对于 v1 的核心变更】
+
+1. 训练架构重构：「空间统一」策略
+   - 所有基模型和元学习器均在变换后的目标空间中训练
+   - 仅在最终输出时进行一次逆变换
+   - 解决了 v1 中原始空间训练的目标分布偏斜问题
+
+2. 新增 Cubist 基学习器
+   - 实现为 ExtraTrees + Ridge 的两阶段模型
+   - ExtraTrees 先做粗预测，Ridge 对残差进行线性修正
+   - 提供了与纯树模型互补的线性建模能力
+   - HPO：n_estimators[100-500]、max_depth[5-25]、max_features[0.3-0.9]
+
+3. SMOGN 启发的分层增强
+   - 针对 Tc > 77.0K（物理上的高温超导阈值）的样本进行有放回采样
+   - 对复制的样本加入高斯噪声（std = 0.5% × 特征值）
+   - 增强比例：高温样本数 × 1.5 倍
+   - 在 HPO 的 5-fold CV 每一 fold 和 Stacking CV 中均应用
+
+4. 自适应目标变换选择
+   - 比较 log1p、sqrt、Power(Yeo-Johnson) 三种变换
+   - 使用 XGBoost(200 trees) 快速 5-fold CV 评估
+   - 选择 RMSE 最低的变换方式
+
+5. 非线性元学习器
+   - BayesianRidge：贝叶斯岭回归，自动推断正则化强度
+   - RidgeCV：对数空间搜索最佳 alpha[1e-4, 1e4]
+   - ShallowRF(depth=3)：浅层随机森林，捕获基模型间的非线性交互
+   - 若 top-2 元学习器 RMSE 相差 < 0.5%，则加权混合两者
+
+6. 多种子集成 + Checkpoint 机制
+   - 3 个随机种子 [42, 123, 2026]
+   - 每个种子独立进行 HPO + CV + 重训练
+   - 最终对 3 个种子的预测取平均作为集成结果
+   - 引入 _checkpoint.pkl 断点续训机制
+
+7. HPO 改进
+   - 每个模型的 HPO 变为 5-fold CV（v1 是单 fold）
+   - HPO 内部也应用 SMOGN（保持数据分布一致性）
+   - SMOGN 的加入使得 HPO 搜寻到的参数更鲁棒
+
+8. 特征选择阈值调整
+   - corr_thresh 从 0.98 收紧至 0.92
+   - 减少冗余特征，增强基模型间的多样性
+   - 这一调整有利于堆叠（Stacking 要求基模型多样化）
+
+9. 特征工程扩充
+   - v2 在 v1 已有的 20+ 特征基础上新增了约 20 个特征：
+     - fie×tc、ea×tc、fh×tc、ar×fh、fie×fh（热-电-机械交叉）
+     - tc×val、dens×val、log_dens、sqrt_tc、sqrt_ar（非单调变换）
+     - val_electron_density、packing_proxy（晶体结构代理量）
+     - mc_llan_proxy（McMillan 公式的简化代理）
+     - ea_over_tc、fh_over_ar、entropy_tc_product 等
+     - fie_val_heterogeneity、fie_wtd_minus_mean（元素异质性）
+     - tc_cv、dens_cv（变异系数）
+     - val_tc_dens_3way（三因素交互）
+
+10. HPO 缓存机制
+    - hpo_cache/ 目录 + JSON 格式存储
+    - 同一 transform + seed + model_name 组合可复用
+    - 大幅减少重复实验时间
+
+
+================================================================================
+版本 3 — train_v3.py：「8:1:1 数据划分 + 防信息泄漏」
+================================================================================
+
+【内部标识】Stacking Ensemble v3 with 8:1:1 Split
+【架构】与 v2 完全相同（5 基模型 + BayesianRidge/Ridge/ShallowRF）
+【HPO】复用 hpo_cache/ 中的 v2 结果（同一特征空间，无需重新搜索）
+
+【相对于 v2 的核心变更】
+
+1. 引入标准化的 8:1:1 数据划分
+   - Train: 80% (13608 样本) — 模型训练、HPO、CV
+   - Val:   10% (1701 样本)  — 模型选择、集成方式决策
+   - Test:  10% (1701 样本)  — 仅用于最终报告，不参与任何决策
+   - 划分种子固定为 42，确保可复现
+
+2. 消除信息泄漏（Data Leakage Prevention）
+   - 特征选择（VarianceThreshold + Correlation）：仅在 Train 上拟合
+   - 目标变换选择（PowerTransformer）：仅在 Train 上拟合
+   - 对比 v2：v2 使用全部数据进行特征选择和变换拟合，导致 Val/Test
+     信息泄漏到训练过程中
+
+3. 以 Val RMSE 而非 Test RMSE 进行模型选择
+   - 多种子集成 vs. 单种子 → 以 Val RMSE 为准决定
+   - Test 仅用于最终报告的"无偏评估"
+
+4. 独立日志文件
+   - LOG_FILE = "training_log_v3.txt"（v2 使用默认 training_log.txt）
+   - MODEL_PATH = "model_v3.pkl"
+
+5. 新增 Gap 分析
+   - 输出 Val-Train 和 Test-Val 的 RMSE 差距
+   - 用于监测过拟合程度
+
+【训练结果（v3 基线）】
+- 集成 Test RMSE: 9.4681  MAE: 5.1052  R²: 0.9223
+- Val-Train Gap: 5.4491（过拟合严重，Train RMSE=4.53, Val RMSE=9.97）
+- 各单种子 Test RMSE: 9.39/9.51/9.55
+- 总耗时：1272s（HPO 全部从缓存加载）
+
+
+================================================================================
+版本 4 — train_v4.py：「元素组成特征融合 + 移除 CatBoost」
+================================================================================
+
+【内部标识】Stacking Ensemble v4 (Element Fusion)
+【架构】XGB + LGB + ExtraTrees + Cubist (4 基模型，CatBoost 被移除)
+     → BayesianRidge + Ridge + ShallowRF(depth=3)
+
+【相对于 v3 的核心变更】
+
+1. 引入元素组成特征（来自 unique_m_train.csv）
+   - 86 种化学元素的摩尔分数（稀疏矩阵）
+   - 构建了约 30 个派生的元素级特征：
+     - n_element_types：材料中实际出现的元素种类数
+     - transition_metal_frac、rare_earth_frac：过渡金属/稀土元素比例
+     - Cu/O/Fe/As/Se/Ba/Y/La/Sr/Nb/Bi_present（11 个关键元素指示变量）
+     - is_cuprate/is_iron_based/is_bcuprates/is_rare_earth_based
+       （4 种已知超导家族的标识特征）
+     - tm_electron_proxy/re_electron_proxy（电子浓度代理量）
+     - max_element_frac、element_concentration（主元素集中度）
+     - element_entropy、element_entropy_norm（元素组成熵）
+     - max/min_electroneg_in_material、electronegativity_spread
+       （电负性差异）
+   - 电负性查询字典：覆盖 H(2.20) ~ Rn(2.20) 共 86 个元素
+   - 合并后总特征数：196（v3 原始 169 + 元素 27）
+
+2. 移除 CatBoost 基学习器
+   - 原因：CatBoost 在 HPO 中的 CV RMSE 为 10.37-10.59，远差于
+     其他模型（9.44-9.64），拖累了堆叠性能
+   - 从 5 模型降为 4 模型（XGB + LGB + ET + Cubist）
+   - 减少元学习器的输入噪声，使权重分配更有效
+
+3. 独立 HPO 缓存：hpo_cache_v4/
+   - 新的特征空间需要重新搜索最优超参数
+   - 但通过 enqueue_trial 将 v3 的参数注入 Optuna 作为 warm start
+   - 加速收敛，避免从零开始搜索
+
+4. 特征选择阈值放宽
+   - corr_thresh 从 0.92 提升至 0.95
+   - 理由：元素特征是稀疏的，过严的相关性过滤会丢失信号
+   - 特征选择结果：196 → 153（v3: 169 → 126）
+
+5. 最终重训练使用 best_iter + 10（v3 使用 +20）
+   - 减少迭代数，降低过拟合风险
+
+6. GPU 自动检测
+   - 新增 _detect_gpu() 函数，通过 nvidia-smi 检测 CUDA 可用性
+   - XGB 优先使用 GPU(cuda)，LGB 尝试 GPU(失败则回退 CPU)
+   - CatBoost 已被移除，不再需要 GPU 配置
+
+7. LightGBM 加入了 GPU fallback 容错
+   - 若 GPU 不可用，自动切换为 CPU
+
+【训练结果（v4 vs v3 对比）】
+- 最佳单种子 Test RMSE: 9.0769 (vs v3: 9.3953) ↓ 0.32
+- 集成 Test RMSE:     9.1275 (vs v3: 9.4681) ↓ 0.34
+- Test R²:           0.9278 (vs v3: 0.9223)
+- Val-Train Gap:     5.1330 (vs v3: 5.4491) ↓ 0.32，过拟合略有缓解
+- 总耗时：4544s（vs v3: 1272s，HPO 重新搜索 + 元素特征计算）
+- 最佳种子 2026 的 Test R² 为 0.9286（v3 为 0.9210），提升显著
+
+【已知问题】
+- 特征空间扩大后，HPO 搜索可能未能充分探索新的最优正则化区域
+- 部分 V4 的 HPO RMSE 反而略高于 V3（如 XGB: 9.72 vs 9.57），
+  提示需要调整搜索空间
+- 代码末尾注明了"性能退化"和"边界触及"的风险诊断提示
+
+
+================================================================================
+版本 5 — train_v5.py：「HPO 正则化收紧 + 物理特征 + NNLS 元学习器」
+================================================================================
+
+【内部标识】Stacking Ensemble v5
+【架构】XGB + LGB + ExtraTrees + Cubist (4 基模型，CatBoost 仍移除)
+     → BayesianRidge + Ridge + NNLS (ShallowRF 移除)
+
+【相对于 v4 的核心变更】
+
+1. HPO 搜索空间收窄——强化正则化
+   目的：解决 v4 中过拟合（Train-Val gap 大）的问题
+   - XGB:
+     * max_depth: [4, 10] → [3, 8]（限制树深度）
+     * min_child_weight: [1, 7] → [3, 20]（增加叶子节点最小权重）
+     * colsample_bytree: [0.3, 1.0] → [0.15, 0.8]（减少列采样）
+     * reg_alpha: [1e-5, 30] → [1e-3, 100]（扩大 L1 范围）
+     * reg_lambda: [1e-5, 30] → [1e-2, 200]（扩大 L2 范围，
+       上限从 30→200 极大强化了正则化能力）
+   - LightGBM:
+     * num_leaves: [15, 127] → [15, 63]（减半最大叶子数）
+     * min_child_samples: [3, 50] → [10, 80]（显著增加最小样本数）
+     * colsample_bytree: [0.3, 1.0] → [0.15, 0.8]
+     * reg_alpha/lambda: 同 XGB 收紧
+   - ExtraTrees:
+     * max_depth: [8, 40] → [8, 25]（砍掉过深的树）
+     * min_samples_leaf: [1, 15] → [3, 30]（增加叶节点最小样本）
+   - Cubist:
+     * max_depth: [5, 25] → [4, 15]（大幅降低深度上限）
+
+2. 新增物理启发式特征
+   - Mendeleev Number（门捷列夫数）：
+     * 使用 86 个元素的原子序数作为周期表位置代理
+     * 计算加权平均值 mendeleev_mean 和加权方差 mendeleev_var
+     * 反映材料的周期表位置分布
+   - Valence Electron Concentration (VEC)：
+     * 基于 Matthias 定则（超导 Tc 与价电子浓度关联）
+     * 计算 vec_mean 和 vec_var
+     * 各元素的价电子数来自物理参考数据
+
+3. PCA 降维：稀疏元素列的 PCA 压缩
+   - 对 unique_m_train.csv 中 86 列元素分数进行 PCA
+   - 过滤：仅保留 ≥ 20 个非零样本的列（77/86 列通过）
+   - 投影到 15 个主成分（解释 89.5% 方差）
+   - 将 PCA 分量拼接到特征矩阵中
+   - 处理后的训练特征数：172（157 原始 + 15 PCA）
+
+4. 元学习器架构变更
+   - 移除 ShallowRF(depth=3)：在 v4 中始终表现最差
+   - 新增 NNLS（非负最小二乘）：
+     * scipy.optimize.nnls 强制权重非负
+     * 理论优势：防止基模型间的负权重（抵消效应）
+     * 实际效果：v5 中 NNLS 的表现很差（RMSE≈40.7），远不及
+       BayesianRidge/Ridge，未被选中为主元学习器
+
+5. Cube 特征返回 elem_arr
+   - build_element_features 新增返回原始 86 列分数矩阵
+   - 用于后续的 PCA 计算
+   - 配合索引分割（train/val/test 独立索引分配）
+
+6. 独立 HPO 缓存：hpo_cache_v5/
+   - 搜索空间变化，不兼容 v4 缓存
+   - 不使用 warm start（参数空间完全不同）
+
+【训练结果（v5 vs v4 对比）】
+- 最佳单种子 Test RMSE: 9.0389 (vs v4: 9.0769) ↓ 0.04
+- 集成 Test RMSE:     9.0321 (vs v4: 9.1275) ↓ 0.10
+- Test R²:           0.9293 (vs v4: 0.9278)
+- Val-Train Gap:     4.1295 (vs v4: 5.1330) ↓ 1.00 显著！
+- 最佳种子 2026 Train RMSE: 5.25 (v4: 4.61)，Test RMSE: 9.04 (v4: 9.08)
+- 总耗时：4504s
+
+关键观察：Train RMSE 从 v4 的 ~4.6 上升到 v5 的 ~5.2（模型变"弱"了），
+但 Test RMSE 从 9.08 降至 9.04。这证明收紧正则化成功减少了过拟合，
+模型泛化能力提升。
+
+NNLS 元学习器在变换空间中表现极差（RMSE≈40.7），可能是因为：变换后
+的目标空间值分布使得非负约束下的最小二乘无法有效拟合。
+
+
+================================================================================
+版本 6 — train_v6.py：「CatBoost 回归 + 周期表位置特征 + HPO 扩展」
+================================================================================
+
+【内部标识】Stacking Ensemble v6
+【架构】XGB + LGB + CatBoost + ExtraTrees (4 基模型，CatBoost 回归，Cubist 移除)
+     → BayesianRidge + Ridge + NNLS
+
+【相对于 v5 的核心变更】
+
+1. CatBoost 恢复为基学习器（替代 Cubist）
+   - 在 v4 中 CatBoost 因性能差被移除，但在 v6 中被重新引入
+   - 与 v5 相比：用 CatBoost 替换 Cubist
+   - HPO 参数：
+     * learning_rate[0.01, 0.3]、depth[4, 10]
+     * l2_leaf_reg[1.0, 100]（强正则化，范围比 v2 大幅扩大）
+     * random_strength[0.5, 10]、bagging_temperature[0, 1.0]
+   - GPU/CPU 自动适配 + fallback 容错
+
+2. 新增周期表位置特征（Periodic Table Group & Period）
+   - PERIODIC_TABLE 字典：86 个元素的 (族, 周期) 坐标
+   - dom_group/dom_period：占比最大元素的族号和周期数
+   - group_x_period：族 × 周期交互项
+   - second_dom_frac：第二大元素的占比
+   - 物理直觉：超导性质与最外层电子排布密切相关
+
+3. HPO 搜索空间扩大
+   - XGB:
+     * max_depth: [3, 8] → [3, 12]（允许更深）
+     * min_child_weight: [3, 20] → [1, 15]（放宽限制）
+     * n_estimators: 400 → 600（更多轮次）
+   - LGB:
+     * num_leaves: [15, 63] → [15, 127]（恢复大范围）
+     * n_estimators: 400 → 600
+   - ET:
+     * min_samples_leaf: [3, 30] → [3, 30]（不变）
+     * n_estimators: 400 → 600
+   - CatBoost: n_estimators 600, iterations 600
+   - HPO trials: 25 → 35（更多搜索尝试）
+
+4. NNLS 修复——在原始尺度上应用
+   - v5 中 NNLS 在标准化后的 base_oof_s 上计算，导致 RMSE=40.7
+   - v6 修复：NNLS 直接在 base_oof_t（原始 OOF 预测矩阵）上计算
+   - 但修复后仍需 inverse_transform，实际效果仍不如 BayesianRidge/Ridge
+
+5. 预测函数适配 NNLS
+   - _predict_split 中的 _pred_for_meta 函数
+   - 对 NNLS 类型的元模型，使用原始尺度矩阵（X_t）做矩阵乘法
+   - 对其他类型，使用标准化后的矩阵（X_s）做 predict()
+
+6. 独立 HPO 缓存：hpo_cache_v6/
+   - 搜索空间和模型组合变化
+
+【训练结果（v6 vs v5 对比）】
+- 最佳单种子 Test RMSE: 9.0053 (vs v5: 9.0389) ↓ 0.03
+- 集成 Test RMSE:     8.9807 (vs v5: 9.0321) ↓ 0.05
+- Test R²:           0.9301 (vs v5: 0.9293)
+- Val-Train Gap:     4.2975 (vs v5: 4.1295) ↑ 0.17，略有回升
+- Seed 42 的 CV RMSE 异常为 33.90（BayesianRidge + NNLS blend 时
+  NNLS 的预测崩溃），这是混合元学习器的权重混合 bug 导致的。
+
+关键观察：
+- CatBoost HPO RMSE 仍然很高（10.31-10.46），远逊于其他模型
+- 但 4 模型堆叠的集成效果优于 v5
+- 训练总耗时暴增至 31292s（~8.7 小时），主要是因为 CatBoost
+  HPO 耗时极长（每个 seed 约 5800-7700s），占总时间约 60%
+- 特征数 161 原始 + 15 PCA = 176
+
+v6 的最大贡献是证明了：即使 CatBoost 单模型表现不佳，它在堆叠中的
+互补性（与其他模型的相关性低）仍能提升集成效果。
+
+
+================================================================================
+版本 7 — train_v7.py：「5 模型 SLSQP 约束混合 + Debye/容差因子特征」
+================================================================================
+
+【内部标识】Stacking Ensemble v7
+【架构】XGB + LGB + ExtraTrees + Cubist + CatBoost (5 基模型)
+     → SLSQP 约束混合（替代 BayesianRidge/Ridge/NNLS）
+
+【相对于 v6 的核心变更】
+
+1. 5 模型架构——Cubist 和 CatBoost 同时保留
+   - 这是所有版本中模型数量最多的配置
+   - 组合了前序版本的最优发现：
+     * XGB + LGB（始终表现最佳）
+     * ET（v4-v5 的最佳模型）
+     * Cubist（v5 证明有价值，ET+Ridge 双阶段）
+     * CatBoost（v6 证明有互补性）
+
+2. 全新的元学习器：SLSQP 约束混合
+   - 使用 scipy.optimize.minimize(method="SLSQP")
+   - 约束条件：权重 ∈ [0, 1]，权重之和 = 1.0
+   - 目标函数：最小化混合预测的 RMSE
+   - 优势：
+     * 可解释性强：每个基模型的贡献权重一目了然
+     * 自动剪枝：不需要的模型权重会被优化到 0
+     * 防止消除：非负约束杜绝了模型间的错误抵消
+   - 替代了 v3-v6 所有版本中的 BayesianRidge/Ridge/NNLS
+     三级元学习器方案
+   - 不再需要 StandardScaler 对基模型 OOF 做标准化
+
+3. HPO 搜索空间进一步收紧（减少过拟合）
+   - XGB: max_depth [3, 12] → [3, 9]（砍掉最深区间）
+   - LGB: max_depth [4, 12] → [4, 9]、mcs [10, 80] → [15, 100]
+   - ET: 参数范围不变
+   - CatBoost: 参数范围不变
+   - Cubist: SLSQP 约束混合使 Cubist 的 HPO 有独立意义
+
+4. Cupist 的 HPO 全面升级
+   - v5 的 Cubist HPO 只优化 ET 的参数（n_est/max_depth/max_features），
+     Ridge alpha 固定为 1.0
+   - v7 的 Cubist HPO 同时搜索 ET 参数和 Ridge alpha：
+     * cub_depth[6, 30], cub_msl[3, 30], cub_mss[2, 25], cub_mf[0.2, 1.0]
+     * cub_ridge_alpha[0.01, 100]（对数空间）
+   - 多参数联合搜索使得 ET+Ridge 的组合更优
+
+5. Cubist warm-start 策略
+   - 从 hpo_cache_v5/ 加载 v5 的 Cubist 参数作为初始值
+   - 仅进行 15 trials 精调（vs 完整 35 trials）
+   - 节省计算时间同时保持搜索质量
+   - 需要参数名映射：v5 的 max_depth/max_features → v7 的 cub_depth/cub_mf
+   - 若 v5 缓存不存在，回退到完整搜索
+
+6. 新增物理特征
+   - debye_proxy = sqrt(FusionHeat / atomic_mass)
+     * 德拜温度的简化代理：θ_D ∝ √(T_melt / M)
+     * 德拜温度是超导 BCS 理论的核心参数
+   - radius_ratio_max_min = atomic_radius_range / atomic_radius_mean
+     * 原子半径的极差/均值比（Goldschmidt 容差因子的变体）
+     * 反映晶体结构的稳定性和畸变程度
+   - 合并后总特征数：206（v6: 204 + 2 新特征）
+
+7. 全局重命名 v6 → v7
+   - LOG_FILE → training_log_v7.txt
+   - MODEL_PATH → model_v7.pkl
+   - HPO_CACHE_DIR → hpo_cache_v7/
+   - checkpoint_file → _checkpoint_v7.pkl
+
+8. 参数归一化处理
+   - 当从 v5 缓存加载的 Cubist 参数缺少 v7 新增字段时
+     （如 cub_msl、cub_mss、cub_ridge_alpha），自动填充默认值
+
+【训练结果（v7 vs v6 对比）】
+- 最佳单种子 Test RMSE: 8.9455 (vs v6: 9.0053) ↓ 0.06
+- 集成 Test RMSE:     8.9487 (vs v6: 8.9807) ↓ 0.03
+- Test R²:           0.9307 (vs v6: 0.9301)
+- Train RMSE:        4.9787 (vs v6: 4.9092)，训练集拟合略减弱
+- Val-Train Gap:     4.2404 (vs v6: 4.2975) ↓ 0.06，过拟合再降
+- 总耗时：2185s（vs v6: 31292s）↓ 93%！
+
+关键观察：
+- SLSQP 混合权重揭示：
+  * CatBoost 在所有 3 个种子中权重被优化为 0.0000（完全排除）
+  * ExtraTrees 获得了最高权重（0.34-0.38）
+  * XGB + LGB 合计约 0.50-0.62
+  * Cubist 权重较小（0.00-0.09），但在不同种子间不稳定
+- 这证明了 SLSQP 的"自动剪枝"能力：CatBoost 单模型性能差且
+  与 top 模型相关性高时，优化器自然地将其排除
+- 训练时间大幅缩短（2185s vs 31292s）是因为 v7 复用了 v6 的
+  HPO 缓存（XGB/LGB/ET/CatBoost 的搜索空间相同或接近），
+  Cubist 仅做了 15 trials
+
+
+================================================================================
+版本 8 — train_v8.py：「4 模型回归 + SLSQP 多点启动 + 10-fold CV + 拓宽 HPO」
+================================================================================
+
+【内部标识】Stacking Ensemble v8
+【架构】XGB + LGB + ExtraTrees + Cubist (4 基模型，CatBoost 再次移除)
+     → SLSQP 约束混合（多点启动，唯一元学习器）
+
+【相对于 v7 的核心变更】
+
+1. CatBoost 彻底移除
+   - v7 中 SLSQP 在所有 3 个种子中将 CatBoost 权重优化为 0.0000
+   - v8 从源头移除 CatBoost，回归 4 模型架构（XGB + LGB + ET + Cubist）
+   - 逻辑：既然优化器自动舍弃 CatBoost，不如直接减少一个模型的
+     计算开销和 HPO 时间
+
+2. SLSQP 多点启动（Multi-Start Initialization）
+   - v7 的 SLSQP 仅从均匀权重起点开始优化，可能陷入局部最优
+   - v8 引入 3 个不同的初始权重向量：
+     * 均匀起点：w_i = 1/n（与 v7 相同）
+     * 最优单模型起点：只有表现最好的单个基模型权重为 1.0
+     * 随机起点：Dirichlet 分布生成的随机权重向量
+   - 对 3 个起点分别运行 SLSQP，取目标函数最低的结果
+   - 这一改进有效避免了非凸约束优化中的局部最优问题
+
+3. Stacking CV 从 5-fold 升级为 10-fold
+   - v3-v7 均使用 5-fold CV 生成基模型 OOF 预测
+   - v8 改为 10-fold，每个 fold 的训练数据从 80%→90% 的 Train 集
+   - 好处：
+     * OOF 预测更加稳定（更多验证 fold 平均）
+     * SLSQP 元学习器基于更可靠的 OOF 估计来优化权重
+     * 代价：每 fold 的训练样本增加但 fold 数翻倍，CV 总时间约翻倍
+   - 日志显示 10 个 fold 的 Blend RMSE 波动更大（如 seed 42:
+     8.25-10.27），这是因为每 fold 验证集更小（1360 样本 vs 2722）
+
+4. HPO 搜索空间大幅拓宽——从收紧转为扩张
+   v5 因过拟合严重而收紧 HPO，v8 在新 178 维特征+元素+PCA 空间下
+   重新拓宽搜索边界，让 Optuna 有更大自由度寻找真正的最优参数：
+   - XGB:
+     * max_depth: [3, 9] → [3, 14]（v6 的 [3,12] 基础上再扩大）
+     * min_child_weight: [1, 15] → [1, 20]
+     * colsample_bytree: [0.15, 0.8] → [0.1, 0.9]（更低的下限）
+     * reg_alpha: [1e-3, 100] → [1e-4, 200]（下限降低 10×，上限翻倍）
+     * reg_lambda: [1e-2, 200] → [1e-3, 300]（下限降低 10×，上限 +50%）
+   - LightGBM:
+     * max_depth: [4, 9] → [4, 14]（最深允许 +56%）
+     * num_leaves: [15, 127] → [10, 200]（上限从 127→200，几乎翻倍）
+     * min_child_samples: [15, 100] → [5, 100]（下限降低，允许更精细分裂）
+     * colsample/reg_alpha/reg_lambda: 与 XGB 同步放宽
+   - ExtraTrees:
+     * max_depth: [6, 30] → [5, 40]（最深树 +33%）
+     * min_samples_leaf: [3, 30] → [1, 20]（允许更小叶子）
+     * max_features: [0.2, 1.0] → [0.15, 1.0]
+   - Cubist (ET 部分):
+     * max_depth: [6, 30] → [4, 30]
+     * min_samples_leaf: [3, 30] → [1, 20]
+     * max_features: [0.2, 1.0] → [0.1, 1.0]
+     * Ridge alpha: [0.01, 100] → [0.001, 500]（下限 10×，上限 5×）
+
+5. HPO Warm-start 策略变更
+   - XGB/LGB/ET：从 hpo_cache_v6 加载参数作为 warm start
+     * 在拓宽后的搜索空间中精调 15 trials
+     * v6 cache 不存在时回退到完整 35 trials
+   - Cubist：完全独立搜索
+     * v7 的 Cubist 从 v5 cache warm-start + 15 trials 精调
+     * v8 的 Cubist 在当前 178 特征空间中做完整 30-trial HPO
+     * 这是最重要的变化：Cubist 的参数空间与特征空间完全匹配，
+       没有历史缓存的"惯性"干扰
+     * Cubist HPO 日志显示各 seed 的 CV RMSE 分别为 9.61/9.47/9.58，
+       优于 v7 的 ~9.71
+
+6. 特征集与 v7 完全相同
+   - 原始特征 206（ml_train 统计 + 元素特征 + Mendeleev/VEC/周期表 +
+     Debye/容差因子）
+   - 特征选择后 163（corr_thresh=0.95）
+   - PCA 后 178（+ 15 个元素 PCA 分量）
+   - 自适应目标变换：sqrt 被选中（RMSE=9.8974，与 v7 一致）
+
+7. 全局重命名 v7 → v8
+   - LOG_FILE → training_log_v8.txt
+   - MODEL_PATH → model_v8.pkl
+   - HPO_CACHE_DIR → hpo_cache_v8/
+   - checkpoint_file → _checkpoint_v8.pkl
+   - 增加了 HPO_CACHE_DIR_V6 引用（用于 XGB/LGB/ET 的 warm-start）
+
+8. 代码结构优化
+   - constrained_blending 函数增加了 3-start 初始化逻辑
+   - 使用 np.random.default_rng(42) 固定随机起点的种子
+   - best_idx 通过单模型 RMSE 比较自动确定最优单模型起点
+   - Dirichlet 分布确保随机起点满足权重之和为 1 的约束
+
+【训练结果（v8 vs v7 对比）】
+- 最佳单种子 Test RMSE: 8.9344 (vs v7: 8.9455) ↓ 0.01
+- 集成 Test RMSE:     8.9365 (vs v7: 8.9487) ↓ 0.01
+- Test R²:           0.9308 (vs v7: 0.9306)
+- Train RMSE:        4.7669 (vs v7: 4.9787) ↓ 0.21，v8 训练集拟合更强
+- Val-Train Gap:     4.5009 (vs v7: 4.2404) ↑ 0.26，过拟合有所回升
+- 总耗时：3861s（vs v7: 2185s）↑ 77%，因 Cubist 做了完整 30-trial HPO
+
+关键观察：
+
+1. SLSQP 混合权重大幅变化：
+   - v7 中 ET 是核心（权重 0.37-0.38），Cubist 权重很小（0.00-0.09）
+   - v8 中 Cubist 成为核心（权重 0.38-0.60），ET 在 2/3 种子中权重为 0
+   - 这个巨大变化源于两点：(a) Cubist 在当前特征空间做了完整 30-trial HPO，
+     找到了更好的参数；(b) 拓宽的 HPO 边界让 Cubist 的 ET+Ridge 组合
+     搜索到了更优配置
+   - XGB 权重波动很大（0.04-0.39），在不同种子间不稳定
+   - LGB 表现稳定（0.11-0.37）
+
+2. 10-fold CV 的效果：
+   - 10-fold 的 fold 间 Blend RMSE 方差更大（如 seed 123: 8.05-10.47）
+     但均值更稳定
+   - 更多的验证 fold 为 SLSQP 提供了更全面的 OOF 协方差估计
+   - 但也使每 fold 训练时间增加（训练集从 5-fold 的 80%→10-fold 的 90%）
+
+3. 过拟合 vs 泛化权衡：
+   - v8 的 Train RMSE（4.77）好于 v7（4.98），但 Val-Train Gap（4.50）
+     差于 v7（4.24）
+   - 这表明拓宽 HPO 边界虽然让模型在训练集上拟合得更好，但也部分
+     恢复了过拟合趋势
+   - 但 Test RMSE 仍然略微降低，说明整体泛化能力有边际提升
+
+4. 实验效率：
+   - Cubist 的全 30-trial HPO 每个种子约 740-945s，占总时间约 60%
+   - XGB/LGB/ET 均从 v6 缓存加载，省去了大量 HPO 时间
+   - 总时间 3861s（约 1 小时），处于可接受范围
+
+5. 边际收益递减现象：
+   - v7→v8 的 Test RMSE 下降仅 0.01，远小于 v6→v7 的 0.06
+   - 这表明模型性能可能正在接近当前特征空间和架构的上限
+   - 后续改进方向可能在于：新的特征工程、不同的损失函数、
+     或引入深度学习架构
+
+
+================================================================================
+版本 9 — train_v9.py：「XGBoost 非线性元学习器 + 90/10 划分 + 全模型 HPO」
+================================================================================
+
+【内部标识】Stacking Ensemble v9
+【架构】XGB + LGB + ExtraTrees + Cubist (4 基模型)
+     → XGBoost Meta-learner (depth=2, n=100, 强正则) + IsotonicRegression 校准
+
+【相对于 v8 的核心变更】
+
+1. 元学习器重构：XGBoost 非线性混合替代 SLSQP 线性混合
+   这是 v9 最重要的架构变更。
+   - v7-v8 使用 SLSQP 约束优化求解线性权重 w_i，最终预测 = Σ w_i × pred_i
+   - v9 使用一个浅层 XGBoost 回归器作为元学习器：
+     * n_estimators=100, max_depth=2（极浅，防止过拟合）
+     * learning_rate=0.1
+     * reg_alpha=1.0, reg_lambda=5.0（强 L1+L2 正则化）
+     * subsample=0.8, colsample_bytree=0.8（行/列采样防过拟合）
+   - 关键优势：
+     * 非线性：XGBoost 可学习基模型预测之间的非线性交互关系
+     * 自动特征选择：XGBoost 内建的树结构自动忽略不重要的基模型
+     * 无需约束：树模型天然不存在负权重抵消问题
+     * 更强表达力：depth=2 允许最多 4 个叶子节点，能捕获 pairwise
+       基模型之间的条件依赖（如"当 XGB 预测高且 LGB 预测低时如何调整"）
+   - SLSQP 的本质局限在于它只能做线性加权，而现实中基模型的误差
+     往往是异质的（某些材料上 XGB 更准，另一些上 LGB 更准），
+     非线性元学习器可以学会在不同区域依赖不同的基模型
+
+2. 90/10 Train/Test 划分——移除 Val 集
+   - v3-v8 使用 8:1:1（Train 80%/Val 10%/Test 10%）划分
+   - v9 改为 90/10（Train 90%/Test 10%），不再保留 Val 集
+   - 理由：
+     * v9 始终使用 3-seed 集成，不基于 Val 进行单种子 vs 集成的选择
+     * 省出的 1701 个样本（从 Val 并入 Train）提供了更多训练数据
+   - Train 集从 13608 增加到 15309，增加 12.5% 的样本
+   - Test 集不变（1701 样本），与之前版本直接可比
+   - 代价：无法通过 Val 监控过拟合趋势，只能观察 Train-Test gap
+
+3. 全模型在当前特征空间完整 HPO——不再是部分复用缓存
+   v8 的策略：XGB/LGB/ET 从 v6 缓存加载（只需 15 trials 精调），
+   仅 Cubist 做完整的 30-trial HPO。
+   v9 的策略：所有 4 个模型都在 178 维当前特征空间中做完整的 HPO
+   搜索，以 v8 缓存作为 warm start：
+   - XGB = 25 trials（v8 warm start + 精调）
+   - LGB = 25 trials（v8 warm start + 精调）
+   - ET  = 20 trials（v8 warm start + 精调）
+   - Cubist = 20 trials（v8 warm start + 精调）
+   - 使用 TRIAL_MAP 字典统一管理各模型的不同 trial 数
+   - HPO 搜索空间与 v8 相同（拓宽后的边界），无变更
+   - 这一策略的合理性：特征空间没有变化，但之前 XGB/LGB/ET 的
+     HPO 是在不同特征空间下进行的（v6 的特征空间不同），在当前
+     特征空间中做完整搜索可以找到更匹配的参数
+
+4. SMOGN 参数调优——更激进的增强
+   - 阈值：77.0K → 50.0K（降低 35%）
+     * 物理意义：50K 覆盖了更多"中高温"超导体
+     * 更多样本被识别为需要增强的目标
+   - 增强比例：1.5 → 2.0（提升 33%）
+     * 对 Tc > 50K 的中高温样本做 2 倍增强
+     * 与阈值降低叠加，实际增强样本数大幅增加
+   - 噪声 scale 不变（0.005）
+
+5. IsotonicRegression 残差校准——v9 的新增后处理步骤
+   - 在所有 3 种子集成预测完成后，对集成结果做保序回归校准
+   - 在校准后的 Train 集上拟合 IsotonicRegression(out_of_bounds="clip")
+   - 同时对 Train 和 Test 预测做 transform
+   - 理论依据：IsotonicRegression 学习一个单调非递减的校准函数，
+     修正模型预测中的系统性偏差，且不会过拟合（只有一个自由度方向）
+   - 日志显示校准效果：Train RMSE 4.933→4.811，Test RMSE 8.868→8.846
+   - 虽然提升幅度不大（Test 仅降 0.02），但校准是"免费"的后处理，
+     不增加模型复杂度
+
+6. 评估策略简化——固定 3-seed 集成
+   - v3-v8 在 Val RMSE 上比较"多种子集成"与"最佳单种子"，择优输出
+   - v9 不再做此选择：始终输出 3-seed 集成
+   - 逻辑：9 个版本的实验已经充分证明多种子集成始终优于单种子，
+     没有必要在每个版本中重复验证
+   - 代码中移除了 all_val_preds、best_seed_on_val、Val-based 选择
+     等逻辑，代码更简洁
+
+7. 代码适配变更
+   - 导入 IsotonicRegression（from sklearn.isotonic）
+   - 移除 scipy.optimize.minimize 的导入和 constrained_blending 函数
+   - 新增 train_meta_xgb() 函数：封装了 XGBoost 元学习器的
+     训练和逆变换逻辑
+   - run_stacking_cv 返回 meta_model（XGBoost 对象）替代
+     blend_weights（numpy 数组）
+   - _predict_split 中使用 meta_model.predict() 替代
+     base_full_t @ blend_weights
+   - 移除 CatBoost 相关代码残留（不再 import catboost）
+   - HPO_CACHE_DIR_V8 用于 warm start 加载，HPO_CACHE_DIR_V9 用于写入
+
+8. 全局重命名 v8 → v9
+   - LOG_FILE → training_log_v9.txt
+   - MODEL_PATH → model_v9.pkl
+   - HPO_CACHE_DIR → hpo_cache_v9/
+   - checkpoint_file → _checkpoint_v9.pkl
+
+【训练结果（v9 vs v8 对比）】
+- 集成 Test RMSE:     8.8462 (vs v8: 8.9365) ↓ 0.09 —— 显著提升！
+- 校准前 Test RMSE:   8.8676
+- 校准后 Test RMSE:   8.8462 (IsotonicRegression ↓ 0.02)
+- Test R²:           0.9322 (vs v8: 0.9308)
+- Test MAE:          4.7744 (vs v8: 4.8834) ↓ 0.11
+- Train RMSE:        4.8106 (vs v8: 4.7538) ↑ 0.06，训练集拟合稍弱
+- Test-Train Gap:    4.0356 (vs v8 Val-Train: 4.5009)
+  注：v9 是 Test-Train gap，v8 是 Val-Train gap，不完全可比。
+  但大致可看出 v9 的泛化 gap 更小。
+- 各单种子 Test RMSE: 8.88/8.96/8.89（vs v8: 8.93/8.95/8.98），
+  单种子间方差更小
+- 总耗时：11109s（~3.1 小时，vs v8: 3861s）↑ 188%
+
+关键观察：
+
+1. HPO CV RMSE 全面大幅改善：
+   - XGB: 9.39 (v8: 9.64) ↓ 0.25
+   - LGB: 9.42 (v8: 9.67) ↓ 0.25
+   - ET:  9.35 (v8: 9.65) ↓ 0.30
+   - Cubist: 9.34 (v8: 9.61) ↓ 0.27
+   - 所有模型在当前特征空间的完整 HPO 搜索带来了一致的提升，
+     验证了 v8 的"部分复用旧缓存"策略确实限制了 HPO 质量
+
+2. XGBoost 元学习器的 Stack OOF RMSE 为 8.93-8.99（v8 SLSQP 为
+   9.23-9.30），元学习器层面的提升约 0.3 RMSE。这证明了非线性
+   元学习器相对于线性加权的显著优势。
+
+3. 90/10 划分带来了更多训练数据，但也意味着无法像 v8 那样通过
+   Val 监控过拟合。Test-Train gap = 4.04 需要通过与其他版本的
+   相对比较来评估（v8 的 Test-Train gap 可通过 ensemble 结果
+   推算为 8.94-4.75=4.19，v9 略优于 v8）。
+
+4. SMOGN 阈值从 77K 降到 50K 后，更多中温超导样本（50-77K 区间）
+   被增强。这个区间的样本可能对模型学习的贡献更大，因为这正是
+   超导研究中最常见的温度区间。将增强比例提高到 2.0 进一步强化
+   了中高温区域的信号。
+
+5. IsotonicRegression 校准贡献虽小但稳定，验证了即使集成模型
+   也存在轻微的系统性偏差。这种单变量保序回归不会引入过拟合，
+   属于安全的"锦上添花"。
+
+6. 时间成本：全模型 HPO 耗时增加但在可接受范围。XGB 25 trials
+   约 450-824s，LGB 25 trials 约 890-1260s，ET 20 trials
+   约 740-890s，Cubist 20 trials 约 690-870s。总计约 3 小时，
+   相比 v6 的 8.7 小时仍然合理。
+
+7. 架构收敛：经过 9 个版本的迭代，v9 的最优配置可以概括为：
+   - 4 模型（XGB + LGB + ET + Cubist）→ XGBoost 非线性元学习器
+   - 10-fold CV + 全模型在 178 维特征空间中完整 HPO
+   - SMOGN: 50K 阈值 × 2.0 倍增强
+   - 90/10 Train/Test 划分 + 3-seed 集成 + IsotonicRegression 校准
+   - 这一配置在当前的树模型框架下可能接近性能上限
+
+
+================================================================================
+版本迭代总览：核心改进脉络
+================================================================================
+
+┌────────┬──────────────┬───────────────────────────────────────┐
+│ 版本   │ Test RMSE    │ 核心实验主题                           │
+│        │ (最佳种子)    │                                       │
+├────────┼──────────────┼───────────────────────────────────────┤
+│  v3    │   9.3953     │ 基线：5模型堆叠 + SMOGN + 变换空间     │
+│  v4    │   9.0769     │ ↓ 引入元素组成特征，移除不济的CatBoost  │
+│  v5    │   9.0389     │ ↓ 收紧HPO正则化 + 物理FE + PCA降维     │
+│  v6    │   9.0053     │ ↓ 回归CatBoost + 周期表FE + 更大HPO    │
+│  v7    │   8.9455     │ ↓ 5模型 + SLSQP约束混合最优权重        │
+│  v8    │   8.9344     │ ↓ 4模型回归 + SLSQP多启动 + 10-fold    │
+│  v9    │   8.8462     │ ↓ XGBoost非线形元学习器 + 全HPO + 校准  │
+│        │ (3-seed集成) │   (v9起固定输出集成，不再选单种子)      │
+└────────┴──────────────┴───────────────────────────────────────┘
+
+Test RMSE 从 9.40 降至 8.85，累计下降 5.9%。
+
+1. 数据划分与评估（v1 → v9）
+   - v1：简单 80/20 分割 → 不严谨
+   - v3-v8：8:1:1 标准化划分 + Val 用于模型选择
+   - v9：90/10 划分，移除 Val，固定 3-seed 集成，更多训练数据
+
+2. 特征工程（v1 → v9，特征数 169 → 206 原始 / 178 最终）
+   - v1：仅 ml_train.csv 的基础统计特征 + 简单比率
+   - v2：大量物理交互特征（热电交叉、非线性变换）
+   - v4：元素组成特征（86 元素分数 + 超导家族标识）
+   - v5：Mendeleev 数 + VEC + 稀疏 PCA
+   - v6：周期表 Group/Period 坐标
+   - v7-v9：Debye 温度代理 + 容差因子（特征集稳定）
+
+3. 基模型架构（v1 → v9）
+   - v1：4 模型（XGB/LGB/CAT/ET）
+   - v2：5 模型（+Cubist）
+   - v4：4 模型（-CatBoost，因性能差）
+   - v6：4 模型（+CatBoost 回归，-Cubist）
+   - v7：5 模型（Cubist 回归，CatBoost 保留但被 SLSQP 清零）
+   - v8-v9：4 模型（-CatBoost，已被多个版本验证不需要）
+   - 最终共识：XGB + LGB + ET + Cubist 是经过 9 轮验证的最优组合
+
+4. 元学习器（v1 → v9）——变化最大的维度
+   - v1：sklearn StackingRegressor（RidgeCV，原始空间）
+   - v2-v6：BayesianRidge/Ridge/ShallowRF/NNLS 竞争选择
+   - v7：SLSQP 约束混合（线性加权 + 单起点）
+   - v8：SLSQP 约束混合（线性加权 + 3 起点 multi-start）
+   - v9：XGBoost 非线性元学习器（depth=2 树，突破线性加权的天花板）
+
+5. 正则化与过拟合（v4 → v9）
+   - v4：Train-Val gap = 5.13 → 严重过拟合
+   - v5：收紧 HPO + 强正则化 → gap 降至 4.13
+   - v7：gap 稳定在 4.24
+   - v8：gap = 4.50 → 拓宽 HPO 后略有回升
+   - v9：Test-Train gap ≈ 4.04（与 v8 的 Test-Train~4.19 相比更低）
+
+6. SMOGN 策略演进（v1 → v9）
+   - v1：无 SMOGN
+   - v2-v8：阈值 77K，比例 1.5
+   - v9：阈值 50K，比例 2.0（更激进的中高温区域增强）
+
+7. CV 策略演进（v1 → v9）
+   - v1-v2：5-fold
+   - v3-v7：5-fold（在 Train split 内）
+   - v8-v9：10-fold（在 v9 的 90% Train 集内，每 fold 更稳定）
+
+8. 训练效率
+   - v3：1272s（全缓存）
+   - v6：31292s（CatBoost HPO 耗时巨大）
+   - v7：2185s（复用缓存 + Cubist 快速精调）
+   - v8：3861s（Cubist 完整 HPO + 10-fold CV）
+   - v9：11109s（全模型完整 HPO + 10-fold CV，约 3 小时）
+
+
+================================================================================
+注：train_v1.py 实际上是一次独立的实验分支，使用了 sklearn StackingRegressor
+在原始空间训练，但该方案在后续版本中被放弃。train_v2.py 是当前实验序列的
+真正起点。v3 起建立了标准化的 8:1:1 评估体系，v9 起简化为 90/10 固定集成。
+================================================================================
