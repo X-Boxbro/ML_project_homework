@@ -1,0 +1,200 @@
+[12:31:47] Starting train_v12.py (Stacking Ensemble v12 — 5-seed + Residual)
+  Multi-seed: [42, 123, 2026, 888, 777]  (seeds {888, 123} use 80% features)
+  XGB=cuda, LGB=gpu(try), ET=CPU, Cubist=CPU
+  HPO: fully cached from hpo_cache_v11/  |  Residual: ET(n=300,depth=10) on PCA(20)+4 OOF
+
+STEP 0 | Load data & build features
+  Samples=17010  Features=209
+
+STEP 0.5 | Train/Test split (90/10)
+
+STEP 0b | Feature selection + PCA
+  Feature selection: 209 → 166 (var + corr@0.95)
+
+STEP 0c | Target transform (must match v11 cache: sqrt)
+  Using sqrt (v11 cache transform)
+
+=======================================================
+SEED 42  (1/5)
+=======================================================
+STEP 1 | Load HPO params from v11 cache
+  [xgb] loaded (CV=9.4063)
+  [lgb] loaded (CV=9.3862)
+  [et] loaded (CV=9.4031)
+  [cubist] loaded (CV=9.3967)
+STEP 2 | 10-fold stacking CV + meta HPO
+  Fold 1: Blend RMSE=9.1761  [95.9s]
+  Fold 2: Blend RMSE=9.1152  [106.2s]
+  Fold 3: Blend RMSE=9.2563  [111.3s]
+  Fold 4: Blend RMSE=10.1023  [118.0s]
+  Fold 5: Blend RMSE=8.6225  [111.5s]
+  Fold 6: Blend RMSE=8.5628  [110.7s]
+  Fold 7: Blend RMSE=9.0062  [112.4s]
+  Fold 8: Blend RMSE=9.1043  [111.9s]
+  Fold 9: Blend RMSE=8.6776  [111.9s]
+  Fold 10: Blend RMSE=8.6818  [105.6s]
+
+  Training HPO-optimized XGBoost meta-learner (25-trial)...
+    Meta HPO: CV=9.0934 depth=2 n=177 lr=0.0397
+  Stack OOF: RMSE=8.9648  MAE=4.9838  R2=0.9316
+STEP 3 | Retrain + predict
+  Trained xgb
+  Trained lgb
+  Trained et
+  Trained cubist_et
+  Trained cubist_ridge
+STEP 4 | ET residual learner
+  Train: 4.5660  (before: 4.8218)
+  Test:  8.8999  (before: 8.9105)
+
+=======================================================
+SEED 123  (2/5)
+=======================================================
+STEP 1 | Load HPO params from v11 cache
+  [xgb] loaded (CV=9.2830)
+  [lgb] loaded (CV=9.3084)
+  [et] loaded (CV=9.3320)
+  [cubist] loaded (CV=9.3485)
+  Feature subsample: 181→144
+STEP 2 | 10-fold stacking CV + meta HPO
+  Fold 1: Blend RMSE=8.8311  [49.0s]
+  Fold 2: Blend RMSE=9.8530  [64.3s]
+  Fold 3: Blend RMSE=8.8902  [50.5s]
+  Fold 4: Blend RMSE=8.9856  [44.8s]
+  Fold 5: Blend RMSE=8.9655  [59.6s]
+  Fold 6: Blend RMSE=7.9556  [56.0s]
+  Fold 7: Blend RMSE=9.3280  [67.4s]
+  Fold 8: Blend RMSE=8.5258  [54.4s]
+  Fold 9: Blend RMSE=8.9581  [50.6s]
+  Fold 10: Blend RMSE=9.9741  [53.0s]
+
+  Training HPO-optimized XGBoost meta-learner (25-trial)...
+    Meta HPO: CV=9.0296 depth=3 n=267 lr=0.0294
+  Stack OOF: RMSE=8.7852  MAE=4.9065  R2=0.9343
+STEP 3 | Retrain + predict
+  Trained xgb
+  Trained lgb
+  Trained et
+  Trained cubist_et
+  Trained cubist_ridge
+STEP 4 | ET residual learner
+  Train: 4.3687  (before: 4.7125)
+  Test:  8.9192  (before: 8.8974)
+
+=======================================================
+SEED 2026  (3/5)
+=======================================================
+STEP 1 | Load HPO params from v11 cache
+  [xgb] loaded (CV=9.2011)
+  [lgb] loaded (CV=9.1872)
+  [et] loaded (CV=9.2126)
+  [cubist] loaded (CV=9.1819)
+STEP 2 | 10-fold stacking CV + meta HPO
+  Fold 1: Blend RMSE=8.6704  [79.3s]
+  Fold 2: Blend RMSE=9.4265  [79.2s]
+  Fold 3: Blend RMSE=9.3789  [67.1s]
+  Fold 4: Blend RMSE=8.9783  [80.8s]
+  Fold 5: Blend RMSE=9.9480  [75.1s]
+  Fold 6: Blend RMSE=9.1603  [68.5s]
+  Fold 7: Blend RMSE=8.9192  [74.2s]
+  Fold 8: Blend RMSE=8.9624  [66.2s]
+  Fold 9: Blend RMSE=8.2543  [75.8s]
+  Fold 10: Blend RMSE=9.3929  [74.0s]
+
+  Training HPO-optimized XGBoost meta-learner (25-trial)...
+    Meta HPO: CV=9.1282 depth=3 n=297 lr=0.0276
+  Stack OOF: RMSE=8.9100  MAE=4.9119  R2=0.9324
+STEP 3 | Retrain + predict
+  Trained xgb
+  Trained lgb
+  Trained et
+  Trained cubist_et
+  Trained cubist_ridge
+STEP 4 | ET residual learner
+  Train: 4.3458  (before: 4.6242)
+  Test:  8.8816  (before: 8.8776)
+
+=======================================================
+SEED 888  (4/5)
+=======================================================
+STEP 1 | Load HPO params from v11 cache
+  [xgb] loaded (CV=9.4063)
+  [lgb] loaded (CV=9.3862)
+  [et] loaded (CV=9.4031)
+  [cubist] loaded (CV=9.3967)
+  Feature subsample: 181→144
+STEP 2 | 10-fold stacking CV + meta HPO
+  Fold 1: Blend RMSE=8.9529  [76.8s]
+  Fold 2: Blend RMSE=8.7506  [64.8s]
+  Fold 3: Blend RMSE=9.3747  [66.2s]
+  Fold 4: Blend RMSE=9.6965  [77.3s]
+  Fold 5: Blend RMSE=8.5325  [75.9s]
+  Fold 6: Blend RMSE=8.6644  [77.7s]
+  Fold 7: Blend RMSE=9.5206  [66.3s]
+  Fold 8: Blend RMSE=8.5346  [78.3s]
+  Fold 9: Blend RMSE=8.6588  [80.8s]
+  Fold 10: Blend RMSE=10.0739  [78.4s]
+
+  Training HPO-optimized XGBoost meta-learner (25-trial)...
+    Meta HPO: CV=9.1145 depth=3 n=226 lr=0.0355
+  Stack OOF: RMSE=8.8931  MAE=4.9409  R2=0.9327
+STEP 3 | Retrain + predict
+  Trained xgb
+  Trained lgb
+  Trained et
+  Trained cubist_et
+  Trained cubist_ridge
+STEP 4 | ET residual learner
+  Train: 4.5909  (before: 4.8592)
+  Test:  8.8452  (before: 8.8677)
+
+=======================================================
+SEED 777  (5/5)
+=======================================================
+STEP 1 | Load HPO params from v11 cache
+  [xgb] loaded (CV=9.2830)
+  [lgb] loaded (CV=9.3084)
+  [et] loaded (CV=9.3320)
+  [cubist] loaded (CV=9.3485)
+STEP 2 | 10-fold stacking CV + meta HPO
+  Fold 1: Blend RMSE=8.9471  [56.7s]
+  Fold 2: Blend RMSE=9.3889  [60.0s]
+  Fold 3: Blend RMSE=9.6641  [64.0s]
+  Fold 4: Blend RMSE=8.8298  [60.5s]
+  Fold 5: Blend RMSE=9.3295  [58.1s]
+  Fold 6: Blend RMSE=8.6810  [57.4s]
+  Fold 7: Blend RMSE=8.6552  [54.6s]
+  Fold 8: Blend RMSE=8.7082  [57.4s]
+  Fold 9: Blend RMSE=9.4433  [77.5s]
+  Fold 10: Blend RMSE=8.5739  [61.7s]
+
+  Training HPO-optimized XGBoost meta-learner (25-trial)...
+    Meta HPO: CV=9.0460 depth=3 n=300 lr=0.0229
+  Stack OOF: RMSE=8.8159  MAE=4.9122  R2=0.9338
+STEP 3 | Retrain + predict
+  Trained xgb
+  Trained lgb
+  Trained et
+  Trained cubist_et
+  Trained cubist_ridge
+STEP 4 | ET residual learner
+  Train: 4.3377  (before: 4.6632)
+  Test:  8.9163  (before: 8.8807)
+
+=======================================================
+FINAL 5-SEED ENSEMBLE RESULTS
+=======================================================
+  Train RMSE: 4.3974  MAE: 1.9923  R2: 0.9835
+  Test  RMSE: 8.8387  MAE: 4.7206  R2: 0.9323
+  [PRIMARY] Test RMSE: 8.8387  (5-seed ensemble + residual)
+
+  Model saved: model_v12.pkl
+
+=======================================================
+FINAL RESULTS (v12 — 5-seed + Residual)
+=======================================================
+  Features: 209  |  Seeds: 5 [42, 123, 2026, 888, 777]
+  HPO: cached  |  Residual: ET(300, depth=10) on PCA(20)+4 OOF  |  5-seed ∫
+  Train RMSE: 4.3974  |  Test RMSE: 8.8387  MAE: 4.7206  R2: 0.9323
+  Total time: 4335s
+=======================================================
