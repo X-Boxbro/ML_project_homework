@@ -1011,12 +1011,16 @@ def main():
     elem_test_np  = np.nan_to_num(elem_test_full,  nan=0.0, posinf=0.0, neginf=0.0)
     nz_mask = (np.abs(elem_train_np) > 1e-10).sum(axis=0) >= 20
     elem_sparse = elem_train_np[:, nz_mask]
+    pca_obj = None
+    pca_nz_mask = None
     log(f"  Element cols: {nz_mask.sum()}/{elem_train_np.shape[1]} pass non-zero threshold (>=20 samples)")
     if elem_sparse.shape[1] >= 5:
         n_comp = min(15, elem_sparse.shape[1] - 1)
         pca = PCA(n_components=n_comp, random_state=42)
         pca_train = pca.fit_transform(elem_sparse)
         pca_test  = pca.transform(elem_test_np[:, nz_mask])
+        pca_obj = pca
+        pca_nz_mask = nz_mask
         log(f"  PCA: {elem_sparse.shape[1]} sparse cols → {n_comp} components  (explained var: {pca.explained_variance_ratio_.sum()*100:.1f}%)")
         X_train_sel = np.column_stack([X_train_sel, pca_train])
         X_test_sel  = np.column_stack([X_test_sel,  pca_test])
@@ -1286,6 +1290,8 @@ def main():
             "transform_method": best_transform,
             "power_pt": best_power_pt,
             "final_idx": final_idx,
+            "pca": pca_obj,
+            "pca_nz_mask": pca_nz_mask,
         }
         try:
             joblib.dump(checkpoint_pkg, checkpoint_file, compress=3)
@@ -1349,6 +1355,8 @@ def main():
         "transform_method": best_transform,
         "power_pt": best_power_pt,
         "isotonic_reg": ir_calibrator,
+        "pca": pca_obj,
+        "pca_nz_mask": pca_nz_mask,
     }
     try:
         joblib.dump(primary_model_pkg, ROOT / args.model_path, compress=3)
@@ -1380,10 +1388,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-"""Performance Regression: If the v4 Validation RMSE is reliably worse than v3. Adding predictive elemental features should improve the model. If it gets worse, it means the v3 parameters represent a localized "trap" in the new feature space, and TPE is struggling to escape it within 25 trials.
-
-Severe Overfitting: Look at the gap between your Train RMSE and Val/Test RMSE. If this gap is substantially wider in v4 than in v3, it indicates that the model is simply memorizing the new element columns. In this case, you might need a broader search specifically targeting shallower max_depth or higher reg_lambda.
-
-Edge-Hitting in Optuna: If you look at the Optuna output and notice that the best parameters for v4 are constantly hitting the absolute boundaries of your search space (e.g., max_depth always landing exactly on 4 or exactly on 12), it means the true optimum has shifted outside your defined bounds, requiring a fresh, wider search."""
