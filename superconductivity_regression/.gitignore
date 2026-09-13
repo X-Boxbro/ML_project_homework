@@ -1,0 +1,20 @@
+# HPO results cache (auto-generated, safe to delete)
+hpo_cache_v10/
+
+# Trained model files
+*.pkl
+
+# Checkpoint (auto-generated, per-run)
+_checkpoint.pkl
+
+# Logs
+*.log
+training_log.txt
+
+__pycache__/
+
+.claude/
+
+data/
+
+predictions.csv

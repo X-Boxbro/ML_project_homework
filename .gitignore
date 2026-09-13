@@ -1,20 +1,30 @@
-# HPO results cache (auto-generated, safe to delete)
-hpo_cache_v10/
+# ============================================================
+# 文档类文件：不上传仓库（pptx 为课件，与 docx 同类处理）
+# ============================================================
+*.pdf
+*.doc
+*.docx
+*.ppt
+*.pptx
+*.xmind
+*.zip
+*.rar
+*.7z
 
-# Trained model files
-*.pkl
-
-# Checkpoint (auto-generated, per-run)
-_checkpoint.pkl
-
-# Logs
-*.log
-training_log.txt
-
+# ============================================================
+# Python 运行产物
+# ============================================================
 __pycache__/
+*.py[cod]
 
-.claude/
-
+# ============================================================
+# 各项目的大文件与自动生成文件
+# （superconductivity_regression/ 下另有专属 .gitignore）
+# ============================================================
+*.pkl
 data/
-
+hpo_cache_v9/
+hpo_cache_v10/
+training_log*.txt
 predictions.csv
+.claude/
