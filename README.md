@@ -1,38 +1,40 @@
-# 机器学习课程实验仓库 (project_for_MLcourse)
+# Machine Learning Course Experiments (project_for_MLcourse)
 
-南开大学《机器学习》课程实验集合。所有实验均从 MATLAB 官方示例迁移/扩展为 Python 实现，每个子目录为一个独立实验，互不依赖，可单独运行。
+**[English](README.md) | [简体中文](README.zh-CN.md)**
 
-## 目录结构
+Nankai University Machine Learning course experiments. All experiments are migrated/extended from the official MATLAB examples to Python. Each subdirectory is an independent experiment with no cross-dependencies and can be run standalone. Bilingual (EN/中文) READMEs are provided in every subdirectory.
 
-| 目录 | 实验 | 主要内容 |
+## Repository Layout
+
+| Directory | Experiment | Description |
 |---|---|---|
-| [`perceptron/`](perceptron/) | 实验一：感知机 | 感知机原始形式（Pocket 算法）训练与分类面可视化；附加题：不同学习率迭代过程、去掉错分判断的影响、线性不可分行为、数据中心距离与高维（100 维）扩展 |
-| [`svm/`](svm/) | 实验二：支持向量机 | 手写 SMO 算法求解 SVM 对偶问题（线性核），含增广拉格朗日法对比实现；线性可分/不可分实验、C 值影响、软/硬间隔、收敛性分析 |
-| [`Kmeans/`](Kmeans/) | 实验三：K-means 聚类 | 手写 K-means（9 簇数据集），10 次随机初始化实验与 SSE 汇总；附加题：6 簇数据集（Kmeans2） |
-| [`superconductivity_regression/`](superconductivity_regression/) | 期末大作业：超导临界温度回归 | UCI 超导数据集回归任务；v10 五模型 Stacking 集成（XGB + LGB + ET + Cubist + HGB）+ XGBoost 元学习器 HPO + 等渗校准，Test RMSE 8.84 vs Baseline 10.22。详见其 [README](superconductivity_regression/README.zh-CN.md) |
+| [`perceptron/`](perceptron/) | Lab 1: Perceptron | Perceptron primal form (Pocket algorithm) training and decision-boundary visualization; bonuses: iteration process under different learning rates, effect of removing the misclassification check, linearly-inseparable behavior, effect of cluster-center distance, and 100-D high-dimensional extension |
+| [`svm/`](svm/) | Lab 2: Support Vector Machine | Hand-written SMO solver for the SVM dual problem (linear kernel), with an Augmented Lagrangian implementation for comparison; experiments on separable / inseparable data, effect of C, soft vs. hard margin, and convergence analysis |
+| [`Kmeans/`](Kmeans/) | Lab 3: K-means Clustering | Hand-written K-means (9-cluster dataset) with 10 random-initialization runs and SSE summary; bonus: 6-cluster dataset (Kmeans2) |
+| [`superconductivity_regression/`](superconductivity_regression/) | Final Project: Superconductivity Critical Temperature Regression | UCI superconductivity regression; v10 five-model stacking ensemble (XGB + LGB + ET + Cubist + HGB) + XGBoost meta-learner HPO + isotonic calibration, Test RMSE 8.84 vs Baseline 10.22. See its [README](superconductivity_regression/README.md) for full details. |
 
-## 运行环境
+## Environment
 
-实验一~三仅需 `numpy` 与 `matplotlib`：
-
-```bash
-pip install numpy matplotlib
-```
-
-实验四依赖见 [`superconductivity_regression/requirements.txt`](superconductivity_regression/requirements.txt)。
-
-## 快速运行
+Labs 1-3 need only `numpy` and `matplotlib` (Lab 2 additionally needs `scipy`):
 
 ```bash
-python perceptron/perceptron.py        # 实验一：感知机
-python perceptron/perceptron_add.py    # 实验一：附加题 1-5
-python svm/svm_manual.py               # 实验二：SVM (SMO)
-python Kmeans/kmeans.py                # 实验三：K-means
+pip install numpy matplotlib scipy
 ```
 
-实验四训练/推理命令见 [superconductivity_regression/README.zh-CN.md](superconductivity_regression/README.zh-CN.md#9-环境与运行)。
+Lab 4 dependencies: see [`superconductivity_regression/requirements.txt`](superconductivity_regression/requirements.txt).
 
-## 说明
+## Quick Start
 
-- 课件（pptx）、实验报告（docx/pdf）等文档类文件不上传仓库，见根目录 `.gitignore`
-- `superconductivity_regression/` 中保留了项目专属的 `.gitignore` 与 `.gitattributes`（统一 LF 换行符）
+```bash
+python perceptron/perceptron.py        # Lab 1: Perceptron
+python perceptron/perceptron_add.py    # Lab 1: Bonus 1-5
+python svm/svm_manual.py               # Lab 2: SVM (SMO + Augmented Lagrangian)
+python Kmeans/kmeans.py                # Lab 3: K-means (incl. bonus)
+```
+
+Lab 4 training / inference: see [superconductivity_regression/README.md](superconductivity_regression/README.md#9-environment-and-usage).
+
+## Notes
+
+- Course slides (pptx), lab reports (docx / pdf) and similar document files are excluded from the repository via the root `.gitignore`
+- `superconductivity_regression/` keeps its own `.gitignore` and `.gitattributes` (enforcing LF line endings)
