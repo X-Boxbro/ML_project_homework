@@ -1,0 +1,15 @@
+# Git 属性：统一文本文件的换行符，避免跨平台（Windows/Git for Windows ↔ Linux）出现“假 Modified”
+# 自动检测文本/二进制；文本文件统一以 LF 存入仓库
+* text=auto
+
+# 源码与文档显式要求 LF
+*.py     text eol=lf
+*.txt    text eol=lf
+*.md     text eol=lf
+*.json   text eol=lf
+*.csv    text eol=lf
+*.log    text eol=lf
+*.sh     text eol=lf
+
+# 模型与数据保持二进制原样
+*.pkl    binary
